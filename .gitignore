@@ -1,0 +1,117 @@
+# ==========================================
+# 🔐 SECRETS, CREDENTIALS & SENSITIVE DATA
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.pfx
+*.p12
+id_rsa
+id_rsa.*
+secrets.*
+credentials.*
+tokens.*
+*.kdbx
+auth_config.json
+
+# ==========================================
+# 🤖 LOCAL AI MODELS & HEAVY WEIGHTS
+# ==========================================
+/weights/
+*.gguf
+*.onnx
+*.bin
+*.pt
+*.pth
+*.safetensors
+/models/
+/ollama_data/
+
+# ==========================================
+# 🐍 PYTHON & VIRTUAL ENVIRONMENTS
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+.venv/
+ENV/
+env/
+
+# ==========================================
+# 🧪 TESTING, LOGS & LOCAL DATABASES
+# ==========================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+utest.xml
+junit.xml
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+chroma_db/
+vector_store/
+
+# ==========================================
+# 💻 IDEs, EDITORS & OS ARTIFACTS
+# ==========================================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm / JetBrains
+.idea/
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# 🔊 AUDIO CAPTURE & MOCK OUTPUTS
+# ==========================================
+test_output.wav
+test_input.wav
+*.wav
+*.mp3
+*.raw
+audio_dumps/

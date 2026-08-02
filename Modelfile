@@ -1,0 +1,11 @@
+# Use forward slashes for Windows paths in Ollama
+FROM "C:/Models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+
+# Define the parameters for low latency and strict adherence
+PARAMETER temperature 0.4
+PARAMETER num_ctx 4096
+PARAMETER num_gpu 999
+
+# Stop tokens are handled natively by Ollama's tool caller, but keeping them is harmless
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
