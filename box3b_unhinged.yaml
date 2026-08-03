@@ -1,17 +1,25 @@
 esphome:
   name: unhinged-box3b
   friendly_name: Unhinged Agent
+  # Required to ensure audio processing doesn't crash the main loop
+  platformio_options:
+    board_build.flash_mode: qio
+    board_build.psram_type: opi
 
 esp32:
   board: esp32s3box
   framework:
     type: esp-idf
+    # Enforce PSRAM allocation for audio buffers and WakeNet
+    sdkconfig_options:
+      CONFIG_SPIRAM: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_SPEED_80M: "y"
 
-# Enable logging and native API
 logger:
 api:
   encryption:
-    key: "" # Leave empty for local dev, or generate a noise_psk
+    key: "" # Leave empty for local dev
 
 ota:
   - platform: esphome
@@ -20,7 +28,9 @@ wifi:
   ssid: "YOUR_WIFI_SSID"
   password: "YOUR_WIFI_PASSWORD"
 
-# Hardware definitions for the ESP32-S3-BOX-3
+# ==========================================
+# 🔊 AUDIO HARDWARE & DSP ROUTING
+# ==========================================
 i2s_audio:
   - id: i2s_audio_bus
     i2s_lrclk_pin: GPIO45
@@ -36,26 +46,53 @@ microphone:
 
 speaker:
   - platform: i2s_audio
-    id: box_speaker
+    id: box_speaker_dac
     dac_type: external
     i2s_dout_pin: GPIO15
     i2s_audio_id: i2s_audio_bus
     mode: mono
 
-# The Voice Assistant Component (The Magic)
+# CRITICAL FIX: The Media Player acts as the intermediary. 
+# The Voice Assistant component needs this to duck audio and perform Acoustic Echo Cancellation (AEC).
+media_player:
+  - platform: speaker
+    id: box_media_player
+    speaker: box_speaker_dac
+
+# ==========================================
+# 🧠 ESP-SR VOICE ASSISTANT (WAKENET + VAD)
+# ==========================================
 voice_assistant:
   id: va
   microphone: box_mic
-  speaker: box_speaker
+  media_player: box_media_player # Linked for AEC and barge-in ducking
   use_wake_word: true
-  vad_threshold: 3 # Aggressive VAD to catch speech quickly
+  vad_threshold: 3 
+  noise_suppression_level: 2 # ESP-SR native noise suppression (0-4)
   
-  # Local wake word model (built into ESPHome for S3)
   wake_word:
     - model: hey-jarvis
 
-  # When the API client (our Python script) is ready, it will handle the rest
   on_client_connected:
-    - logger.log: "Python Bridge Connected"
+    - logger.log: "Python Bridge Connected: Ready for FSM Sync"
   on_client_disconnected:
     - logger.log: "Python Bridge Disconnected"
+
+  # Map Edge Hardware States to our Host FSM via logs/API
+  on_listening:
+    - logger.log: "[EDGE] State: LISTENING"
+  on_stt_end:
+    - logger.log: "[EDGE] State: THINKING (VAD detected silence)"
+  on_tts_start:
+    - logger.log: "[EDGE] State: SPEAKING"
+  on_tts_end:
+    - logger.log: "[EDGE] State: IDLE"
+
+# ==========================================
+# 📺 DISPLAY SCAFFOLDING (LVGL)
+# ==========================================
+# Preparing the SPI bus for the 2.4" screen. UI logic will be added in Phase 2.
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO6
+  miso_pin: GPIO0 # Not used for writing to display, but required by bus
