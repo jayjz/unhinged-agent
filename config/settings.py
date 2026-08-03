@@ -1,88 +1,62 @@
-import asyncio
-import io
-import wave
-from concurrent.futures import ThreadPoolExecutor
-
-import numpy as np
-import torch
-from faster_whisper import WhisperModel
-from loguru import logger
-from piper import PiperVoice
-from piper.download import download_voice, get_voices
-
-from config.settings import settings
+from pydantic import Field, PositiveFloat, PositiveInt, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class AudioPipelineService:
-    def __init__(self):
-        self.stt_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="STT")
-        self.tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="TTS")
+class Settings(BaseSettings):
+    """Runtime configuration loaded from environment variables and `.env`."""
 
-        logger.info("Loading Silero VAD model...")
-        self.vad_model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=True,
-        )
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
-        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE})...")
-        self.stt_model = WhisperModel(
-            settings.STT_MODEL_SIZE,
-            device=settings.STT_DEVICE,
-            compute_type=settings.STT_COMPUTE_TYPE,
-        )
+    # Audio / VAD
+    SAMPLE_RATE: PositiveInt = 16_000
+    VAD_FRAME_SAMPLES: PositiveInt = 512
+    VAD_THRESHOLD: float = Field(default=0.5, ge=0.0, le=1.0)
+    SILENCE_DURATION_MS: PositiveInt = 1_000
+    MAX_AUDIO_BUFFER_SECONDS: PositiveFloat = 30.0
 
-        # --- PIPER TTS INITIALIZATION ---
-        logger.info("Initializing Piper TTS...")
-        self.voice_name = "en_US-lessac-medium"  # High quality, fast
+    # STT
+    STT_MODEL_SIZE: str = "base.en"
+    STT_DEVICE: str = "cuda"
+    STT_COMPUTE_TYPE: str = "float16"
+    STT_MAX_WORKERS: PositiveInt = 1
 
-        # Piper handles downloading the model and config automatically if missing
-        voices = get_voices()
-        if self.voice_name not in voices:
-            logger.info(f"Downloading Piper voice: {self.voice_name}...")
-            download_voice(self.voice_name, "./weights/piper")
+    # LLM
+    OLLAMA_URL: str = "http://localhost:11434"
+    LLM_MODEL: str = "unhinged-qwen"
+    LLM_REQUEST_TIMEOUT_SECONDS: PositiveFloat = 60.0
+    LLM_MAX_TOOL_ROUNDS: PositiveInt = 4
+    LLM_HISTORY_MESSAGES: PositiveInt = 16
 
-        model_path, config_path = voices[self.voice_name]
-        self.tts_model = PiperVoice.load(
-            model_path,
-            config_path=config_path,
-            use_cuda=(settings.STT_DEVICE == "cuda"),
-        )
+    # TTS (HTTP sidecar)
+    TTS_URL: str = "http://localhost:8880"
+    TTS_DEFAULT_VOICE: str = "af_heart"
+    TTS_TIMEOUT_SECONDS: PositiveFloat = 30.0
+    MAX_TTS_RESPONSE_BYTES: PositiveInt = 20 * 1024 * 1024
 
-    def is_speech(self, audio_chunk: np.ndarray) -> float:
-        tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
-        return self.vad_model(tensor_chunk, settings.SAMPLE_RATE).item()
+    # WebSocket / safety bounds
+    MAX_WEBSOCKET_MESSAGE_BYTES: PositiveInt = 64 * 1024
+    MAX_NETWORK_BUFFER_BYTES: PositiveInt = 128 * 1024
+    MAX_CONCURRENT_CONNECTIONS: PositiveInt = 4
+    WEBSOCKET_TOKEN: SecretStr | None = None
+    OUTBOUND_AUDIO_CHUNK_BYTES: PositiveInt = 4_096
 
-    async def transcribe(self, pcm_data: bytes) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.stt_executor, self._sync_transcribe, pcm_data
-        )
+    @field_validator("WEBSOCKET_TOKEN", mode="before")
+    @classmethod
+    def empty_token_is_unset(cls, value: object) -> object:
+        return None if value == "" else value
 
-    def _sync_transcribe(self, pcm_data: bytes) -> str:
-        audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, _ = self.stt_model.transcribe(audio_np, beam_size=1, language="en")
-        return " ".join([segment.text for segment in segments]).strip()
+    @property
+    def vad_frame_size_bytes(self) -> int:
+        return self.VAD_FRAME_SAMPLES * 2  # PCM16 mono
 
-    async def synthesize_speech(self, text: str, voice: str = None) -> bytes:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.tts_executor, self._sync_synthesize, text
-        )
+    @property
+    def max_audio_buffer_bytes(self) -> int:
+        return int(self.MAX_AUDIO_BUFFER_SECONDS * self.SAMPLE_RATE * 2)
 
-    def _sync_synthesize(self, text: str) -> bytes:
-        # Piper synthesizes directly to a byte stream
-        audio_stream = io.BytesIO()
-        wav_stream = wave.open(audio_stream, "wb")
-        wav_stream.setnchannels(1)
-        wav_stream.setsampwidth(2)
-        wav_stream.setframerate(self.tts_model.config.sample_rate)
 
-        # Synthesize and write to the wav stream
-        self.tts_model.synthesize_wav(text, wav_stream)
-        wav_stream.close()
-
-        # Extract raw PCM bytes (skip the 44-byte WAV header for our streaming protocol)
-        pcm_data = audio_stream.getvalue()[44:]
-        return pcm_data
+settings = Settings()
