@@ -1,27 +1,23 @@
 import asyncio
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-import edge_tts
-from faster_whisper import WhisperModel
-from loguru import logger
+import aiohttp
 import numpy as np
 import torch
+from faster_whisper import WhisperModel
+from loguru import logger
 
 from config.settings import settings
 
 
 class AudioPipelineService:
-
     def __init__(self):
+        # We only need one executor now since TTS is handled via async HTTP
         self.stt_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="STT"
         )
-        self.audio_conversion_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="AudioConv"
-        )
 
-        logger.info("Loading Silero VAD model...")
+        logger.info("Loading Silero VAD model into CPU/RAM...")
         self.vad_model, _ = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
@@ -29,25 +25,22 @@ class AudioPipelineService:
             onnx=True,
         )
 
-        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE})...")
+        logger.info(f"Loading Faster-Whisper ({settings.stt_model_size}) to {settings.stt_device}...")
         self.stt_model = WhisperModel(
-            settings.STT_MODEL_SIZE,
-            device=settings.STT_DEVICE,
-            compute_type=settings.STT_COMPUTE_TYPE,
+            settings.stt_model_size,
+            device=settings.stt_device,
+            compute_type=settings.stt_compute_type,
         )
 
-        logger.info(
-            "TTS Engine: edge-tts initialized (Microsoft Azure Neural Voices)"
-        )
-        self.tts_voice = (
-            "en-US-GuyNeural"  # Excellent, natural, low-latency male voice
-        )
+        logger.info(f"TTS Engine: Local Kokoro-82M via {settings.tts_endpoint}")
 
     def is_speech(self, audio_chunk: np.ndarray) -> float:
+        """Runs Silero VAD on a 16kHz audio frame."""
         tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
-        return self.vad_model(tensor_chunk, settings.SAMPLE_RATE).item()
+        return self.vad_model(tensor_chunk, settings.audio_sample_rate).item()
 
     async def transcribe(self, pcm_data: bytes) -> str:
+        """Offloads synchronous Faster-Whisper transcription to a thread pool."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.stt_executor, self._sync_transcribe, pcm_data
@@ -63,51 +56,36 @@ class AudioPipelineService:
         )
         return " ".join([segment.text for segment in segments]).strip()
 
-    async def synthesize_speech(
-        self, text: str, voice: str | None = None
-    ) -> bytes:
-        """Uses edge-tts to generate MP3 audio, then uses FFmpeg to convert it
-
-        to raw 16kHz 16-bit PCM for the WebSocket stream.
+    async def synthesize_speech(self, text: str, voice: str = "af_heart") -> bytes:
         """
-        communicate = edge_tts.Communicate(text, self.tts_voice)
-        mp3_data = bytearray()
-
-        # Collect the MP3 stream asynchronously
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_data.extend(chunk["data"])
-
-        # Offload the synchronous FFmpeg conversion to a thread
-        loop = asyncio.get_running_loop()
-        pcm_data = await loop.run_in_executor(
-            self.audio_conversion_executor,
-            self._convert_mp3_to_pcm,
-            bytes(mp3_data),
-        )
-        return pcm_data
-
-    def _convert_mp3_to_pcm(self, mp3_bytes: bytes) -> bytes:
-        """Uses an FFmpeg subprocess to convert MP3 bytes to raw PCM.
-
-        Requires FFmpeg to be installed on the system PATH.
+        Calls the local Kokoro-FastAPI container asynchronously.
+        Expects a 16kHz 16-bit Mono WAV or PCM payload in return.
         """
-        process = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-i",
-                "pipe:0",
-                "-f",
-                "s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        pcm_data, _ = process.communicate(input=mp3_bytes)
-        return pcm_data
+        if not text.strip():
+            return b""
+            
+        url = f"{settings.tts_endpoint}/v1/audio/speech"
+        payload = {
+            "input": text,
+            "voice": voice,
+            "response_format": "wav" 
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=10.0) as response:
+                    if response.status != 200:
+                        logger.error(f"Local TTS Sidecar Error: HTTP {response.status}")
+                        return b""
+                    
+                    audio_bytes = await response.read()
+                    
+                    # Enforce the edge contract: Strip 44-byte WAV RIFF header to yield raw PCM
+                    if audio_bytes.startswith(b'RIFF'):
+                        return audio_bytes[44:]
+                        
+                    return audio_bytes
+                    
+        except Exception as e:
+            logger.error(f"Failed to connect to local TTS sidecar: {e}")
+            return b""
