@@ -20,12 +20,18 @@ available_tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "transcript": {"type": "string", "description": "The text of the note to save."},
-                    "tags": {"type": "string", "description": "Comma-separated tags extracted from the note."}
+                    "transcript": {
+                        "type": "string",
+                        "description": "The text of the note to save.",
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Comma-separated tags extracted from the note.",
+                    },
                 },
-                "required": ["transcript"]
-            }
-        }
+                "required": ["transcript"],
+            },
+        },
     },
     {
         "type": "function",
@@ -35,13 +41,17 @@ available_tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The keyword or phrase to search for."}
+                    "query": {
+                        "type": "string",
+                        "description": "The keyword or phrase to search for.",
+                    }
                 },
-                "required": ["query"]
-            }
-        }
-    }
+                "required": ["query"],
+            },
+        },
+    },
 ]
+
 
 async def execute_tool(tool_name: str, arguments: dict) -> str:
     logger.info(f"Executing tool: {tool_name} with args: {arguments}")
@@ -49,10 +59,10 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
     if tool_name == "get_current_time":
         now = datetime.datetime.now().strftime("%I:%M %p on %A, %B %d")
         return f"The current time is {now}."
-    
+
     elif tool_name == "save_note":
         return await save_note_tool(arguments)
-        
+
     elif tool_name == "search_notes":
         return await search_notes_tool(arguments)
 

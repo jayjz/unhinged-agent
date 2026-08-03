@@ -14,7 +14,7 @@ class AudioPipelineService:
     def __init__(self):
         # Isolate blocking CPU work to avoid locking the FastAPI event loop
         self.stt_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="STT")
-        
+
         logger.info("Loading Silero VAD model for frame gating...")
         # Silero VAD is lightweight enough to run comfortably on CPU [18]
         self.vad_model, _ = torch.hub.load(
@@ -26,9 +26,11 @@ class AudioPipelineService:
 
         # ⚠️ VRAM BUDGET ENFORCEMENT: Keep STT_MODEL_SIZE to "tiny.en" or "base.en"
         # This consumes ~500MB, leaving ~6.5GB for Qwen2.5-7B and Kokoro on your 8GB RTX 4060.
-        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE}) on {settings.STT_DEVICE}...")
+        logger.info(
+            f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE}) on {settings.STT_DEVICE}..."
+        )
         self.stt_model = WhisperModel(
-            settings.STT_MODEL_SIZE, 
+            settings.STT_MODEL_SIZE,
             device=settings.STT_DEVICE,
             compute_type=settings.STT_COMPUTE_TYPE,
         )
@@ -38,7 +40,7 @@ class AudioPipelineService:
 
     def is_speech(self, audio_chunk: np.ndarray) -> float:
         """
-        VAD Gate: Evaluates 512-sample frames. 
+        VAD Gate: Evaluates 512-sample frames.
         Used during [IDLE] -> [LISTENING] transitions and barge-in detection.
         """
         tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
