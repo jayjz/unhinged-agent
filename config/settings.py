@@ -1,88 +1,80 @@
-import asyncio
-import io
-import wave
-from concurrent.futures import ThreadPoolExecutor
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-import numpy as np
-import torch
-from faster_whisper import WhisperModel
-from loguru import logger
-from piper import PiperVoice
-from piper.download import download_voice, get_voices
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-from config.settings import settings
+    # --- Authentication ---
+    websocket_token: str = Field(default="dev_token_123", description="Required token for /ws/agent connection")
 
+    # --- Hard Bounds (DoS & OOM Prevention) ---
+    max_connections: int = Field(default=5, description="Max concurrent WebSocket connections")
+    max_message_size_bytes: int = Field(default=1048576, description="1MB max WebSocket message size")
+    max_utterance_seconds: int = Field(default=30, description="Max audio duration to process per turn")
+    max_tts_response_bytes: int = Field(default=524288, description="512KB max TTS payload to edge")
+    max_tool_rounds: int = Field(default=3, description="Max consecutive tools before forcing text")
 
-class AudioPipelineService:
-    def __init__(self):
-        self.stt_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="STT")
-        self.tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="TTS")
+    # --- Service Endpoints ---
+    ollama_url: str = Field(default="http://127.0.0.1:11434")
+    ollama_model: str = Field(default="unhinged-qwen")
+    tts_endpoint: str = Field(default="http://127.0.0.1:8880") 
 
-        logger.info("Loading Silero VAD model...")
-        self.vad_model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=True,
-        )
+    # --- Audio Pipeline ---
+    audio_sample_rate: int = Field(default=16000)
+    audio_frame_size: int = Field(default=512) 
+    
+    # --- Model Configs ---
+    stt_model_size: str = Field(default="base.en")
+    stt_device: str = Field(default="cuda")
+    stt_compute_type: str = Field(default="float16")
+    vad_threshold: float = Field(default=0.5)
+    silence_duration_ms: int = Field(default=1000)
 
-        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE})...")
-        self.stt_model = WhisperModel(
-            settings.STT_MODEL_SIZE,
-            device=settings.STT_DEVICE,
-            compute_type=settings.STT_COMPUTE_TYPE,
-        )
+    @field_validator("websocket_token")
+    @classmethod
+    def token_must_not_be_empty(cls, v: str) -> str:
+        if not v or len(v.strip()) < 8:
+            raise ValueError("websocket_token must be at least 8 characters")
+        return v.strip()
 
-        # --- PIPER TTS INITIALIZATION ---
-        logger.info("Initializing Piper TTS...")
-        self.voice_name = "en_US-lessac-medium"  # High quality, fast
+settings = Settings()
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-        # Piper handles downloading the model and config automatically if missing
-        voices = get_voices()
-        if self.voice_name not in voices:
-            logger.info(f"Downloading Piper voice: {self.voice_name}...")
-            download_voice(self.voice_name, "./weights/piper")
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-        model_path, config_path = voices[self.voice_name]
-        self.tts_model = PiperVoice.load(
-            model_path,
-            config_path=config_path,
-            use_cuda=(settings.STT_DEVICE == "cuda"),
-        )
+    # --- Authentication ---
+    websocket_token: str = Field(default="dev_token_123", description="Required token for /ws/agent connection")
 
-    def is_speech(self, audio_chunk: np.ndarray) -> float:
-        tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
-        return self.vad_model(tensor_chunk, settings.SAMPLE_RATE).item()
+    # --- Hard Bounds (DoS & OOM Prevention) ---
+    max_connections: int = Field(default=5, description="Max concurrent WebSocket connections")
+    max_message_size_bytes: int = Field(default=1048576, description="1MB max WebSocket message size")
+    max_utterance_seconds: int = Field(default=30, description="Max audio duration to process per turn")
+    max_tts_response_bytes: int = Field(default=524288, description="512KB max TTS payload to edge")
+    max_tool_rounds: int = Field(default=3, description="Max consecutive tools before forcing text")
 
-    async def transcribe(self, pcm_data: bytes) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.stt_executor, self._sync_transcribe, pcm_data
-        )
+    # --- Service Endpoints ---
+    ollama_url: str = Field(default="http://127.0.0.1:11434")
+    ollama_model: str = Field(default="unhinged-qwen")
+    tts_endpoint: str = Field(default="http://127.0.0.1:8880") 
 
-    def _sync_transcribe(self, pcm_data: bytes) -> str:
-        audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, _ = self.stt_model.transcribe(audio_np, beam_size=1, language="en")
-        return " ".join([segment.text for segment in segments]).strip()
+    # --- Audio Pipeline ---
+    audio_sample_rate: int = Field(default=16000)
+    audio_frame_size: int = Field(default=512) 
+    
+    # --- Model Configs ---
+    stt_model_size: str = Field(default="base.en")
+    stt_device: str = Field(default="cuda")
+    stt_compute_type: str = Field(default="float16")
+    vad_threshold: float = Field(default=0.5)
+    silence_duration_ms: int = Field(default=1000)
 
-    async def synthesize_speech(self, text: str, voice: str = None) -> bytes:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.tts_executor, self._sync_synthesize, text
-        )
+    @field_validator("websocket_token")
+    @classmethod
+    def token_must_not_be_empty(cls, v: str) -> str:
+        if not v or len(v.strip()) < 8:
+            raise ValueError("websocket_token must be at least 8 characters")
+        return v.strip()
 
-    def _sync_synthesize(self, text: str) -> bytes:
-        # Piper synthesizes directly to a byte stream
-        audio_stream = io.BytesIO()
-        wav_stream = wave.open(audio_stream, "wb")
-        wav_stream.setnchannels(1)
-        wav_stream.setsampwidth(2)
-        wav_stream.setframerate(self.tts_model.config.sample_rate)
-
-        # Synthesize and write to the wav stream
-        self.tts_model.synthesize_wav(text, wav_stream)
-        wav_stream.close()
-
-        # Extract raw PCM bytes (skip the 44-byte WAV header for our streaming protocol)
-        pcm_data = audio_stream.getvalue()[44:]
-        return pcm_data
+settings = Settings()

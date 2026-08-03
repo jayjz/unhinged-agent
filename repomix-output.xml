@@ -1,0 +1,1623 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+api/
+  __init__.py
+  server.py
+  websocket.py
+config/
+  __init__.py
+  settings.py
+core/
+  __init__.py
+  fsm.py
+services/
+  __init__.py
+  audio_pipeline.py
+  esphome_bridge.py
+  llm_service.py
+tests/
+  __init__.py
+  test_fsm.py
+  test_llm.py
+  test_tools.py
+  test_websocket.py
+tools/
+  __init__.py
+  registry.py
+.gitignore
+box3b_unhinged.yaml
+index.html
+Modelfile
+PROJECT_STATUS.md
+README.md
+requirements.txt
+test_client.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="api/__init__.py">
+
+</file>
+
+<file path="api/server.py">
+from fastapi import FastAPI
+from loguru import logger
+
+from api.websocket import router as websocket_router
+
+app = FastAPI(title="Unhinged Agent Backend")
+
+# Bind the WebSocket endpoint
+app.include_router(websocket_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Unhinged Agent Server is alive. Awaiting WebSocket connections...")
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "alive", "system": "unhinged"}
+</file>
+
+<file path="api/websocket.py">
+import asyncio
+
+import numpy as np
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from loguru import logger
+
+from config.settings import settings
+from core.fsm import AgentState, StateMachine
+from services.audio_pipeline import AudioPipelineService
+from services.llm_service import LLMService  # Assuming you built this
+
+router = APIRouter()
+
+
+@router.websocket("/ws/agent")
+async def websocket_agent_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("Client connected via WebSocket.")
+
+    fsm = StateMachine()
+    audio_pipeline = AudioPipelineService()
+    llm = LLMService()
+
+    audio_buffer = bytearray()
+    silent_frames_count = 0
+    max_silent_frames = int(
+        (settings.SILENCE_DURATION_MS / 1000.0)
+        / (settings.CHUNK_SIZE / settings.SAMPLE_RATE)
+    )
+
+    # Track background tasks so we can cancel them on barge-in
+    active_llm_task = None
+    active_tts_task = None
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            frame_np = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+            if len(frame_np) != settings.CHUNK_SIZE:
+                continue
+
+            speech_prob = audio_pipeline.is_speech(frame_np)
+
+            # BARGE-IN CHECK
+            if (
+                fsm.current_state in (AgentState.SPEAKING, AgentState.PROCESSING)
+                and speech_prob > settings.VAD_THRESHOLD
+            ):
+                logger.warning("Barge-in detected! Cancelling background tasks.")
+
+                # Cancel LLM if it's still thinking
+                if active_llm_task and not active_llm_task.done():
+                    active_llm_task.cancel()
+
+                # Cancel TTS if it's still generating
+                if active_tts_task and not active_tts_task.done():
+                    active_tts_task.cancel()
+
+                await fsm.transition_to(AgentState.LISTENING)
+                await websocket.send_json({"event": "INTERRUPT"})
+                audio_buffer.clear()
+                silent_frames_count = 0
+                continue  # Skip processing this frame, wait for next
+
+            # State: LISTENING
+            if speech_prob > settings.VAD_THRESHOLD:
+                if fsm.current_state == AgentState.IDLE:
+                    await fsm.transition_to(AgentState.LISTENING)
+                    await websocket.send_json(
+                        {"event": "STATE_CHANGE", "state": "LISTENING"}
+                    )
+
+                audio_buffer.extend(data)
+                silent_frames_count = 0
+
+            elif fsm.current_state == AgentState.LISTENING:
+                audio_buffer.extend(data)
+                silent_frames_count += 1
+
+                if silent_frames_count >= max_silent_frames:
+                    await fsm.transition_to(AgentState.PROCESSING)
+                    await websocket.send_json(
+                        {"event": "STATE_CHANGE", "state": "THINKING"}
+                    )
+
+                    user_prompt = await audio_pipeline.transcribe(bytes(audio_buffer))
+                    audio_buffer.clear()
+                    silent_frames_count = 0
+
+                    if not user_prompt.strip():
+                        await fsm.transition_to(AgentState.IDLE)
+                        await websocket.send_json(
+                            {"event": "STATE_CHANGE", "state": "IDLE"}
+                        )
+                        continue
+
+                    logger.info(f"User Said: {user_prompt}")
+                    await websocket.send_json(
+                        {"event": "TRANSCRIPT", "text": user_prompt}
+                    )
+
+                    # Wrap LLM in a task so it can be cancelled
+                    async def run_llm():
+                        return await llm.query(user_prompt)
+
+                    active_llm_task = asyncio.create_task(run_llm())
+                    ai_response = await active_llm_task
+
+                    logger.info(f"AI Response: {ai_response}")
+                    await fsm.transition_to(AgentState.SPEAKING)
+                    await websocket.send_json(
+                        {"event": "STATE_CHANGE", "state": "SPEAKING"}
+                    )
+
+                    # Wrap TTS in a task so it can be cancelled
+                    async def run_tts():
+                        return await audio_pipeline.synthesize_speech(ai_response)
+
+                    active_tts_task = asyncio.create_task(run_tts())
+                    pcm_audio_out = await active_tts_task
+
+                    # Stream audio
+                    chunk_size = 4096
+                    for i in range(0, len(pcm_audio_out), chunk_size):
+                        if fsm.current_state != AgentState.SPEAKING:
+                            break  # Barge-in broke the loop
+                        await websocket.send_bytes(pcm_audio_out[i : i + chunk_size])
+                        # Calculate exact sleep time for 16kHz 16-bit mono:
+                        # 4096 bytes = 2048 samples. 2048 / 16000 = 0.128 seconds.
+                        await asyncio.sleep(0.125)
+
+                    if fsm.current_state == AgentState.SPEAKING:
+                        await fsm.transition_to(AgentState.IDLE)
+                        await websocket.send_json(
+                            {"event": "STATE_CHANGE", "state": "IDLE"}
+                        )
+
+    except asyncio.CancelledError:
+        logger.info("WebSocket connection cancelled.")
+    except WebSocketDisconnect:
+        logger.info("Client disconnected.")
+    except Exception as e:
+        logger.error(f"WebSocket Error: {e}")
+        await fsm.transition_to(AgentState.ERROR)
+</file>
+
+<file path="config/__init__.py">
+
+</file>
+
+<file path="config/settings.py">
+import asyncio
+import io
+import wave
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import torch
+from faster_whisper import WhisperModel
+from loguru import logger
+from piper import PiperVoice
+from piper.download import download_voice, get_voices
+
+from config.settings import settings
+
+
+class AudioPipelineService:
+    def __init__(self):
+        self.stt_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="STT")
+        self.tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="TTS")
+
+        logger.info("Loading Silero VAD model...")
+        self.vad_model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=True,
+        )
+
+        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE})...")
+        self.stt_model = WhisperModel(
+            settings.STT_MODEL_SIZE,
+            device=settings.STT_DEVICE,
+            compute_type=settings.STT_COMPUTE_TYPE,
+        )
+
+        # --- PIPER TTS INITIALIZATION ---
+        logger.info("Initializing Piper TTS...")
+        self.voice_name = "en_US-lessac-medium"  # High quality, fast
+
+        # Piper handles downloading the model and config automatically if missing
+        voices = get_voices()
+        if self.voice_name not in voices:
+            logger.info(f"Downloading Piper voice: {self.voice_name}...")
+            download_voice(self.voice_name, "./weights/piper")
+
+        model_path, config_path = voices[self.voice_name]
+        self.tts_model = PiperVoice.load(
+            model_path,
+            config_path=config_path,
+            use_cuda=(settings.STT_DEVICE == "cuda"),
+        )
+
+    def is_speech(self, audio_chunk: np.ndarray) -> float:
+        tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
+        return self.vad_model(tensor_chunk, settings.SAMPLE_RATE).item()
+
+    async def transcribe(self, pcm_data: bytes) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.stt_executor, self._sync_transcribe, pcm_data
+        )
+
+    def _sync_transcribe(self, pcm_data: bytes) -> str:
+        audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self.stt_model.transcribe(audio_np, beam_size=1, language="en")
+        return " ".join([segment.text for segment in segments]).strip()
+
+    async def synthesize_speech(self, text: str, voice: str = None) -> bytes:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.tts_executor, self._sync_synthesize, text
+        )
+
+    def _sync_synthesize(self, text: str) -> bytes:
+        # Piper synthesizes directly to a byte stream
+        audio_stream = io.BytesIO()
+        wav_stream = wave.open(audio_stream, "wb")
+        wav_stream.setnchannels(1)
+        wav_stream.setsampwidth(2)
+        wav_stream.setframerate(self.tts_model.config.sample_rate)
+
+        # Synthesize and write to the wav stream
+        self.tts_model.synthesize_wav(text, wav_stream)
+        wav_stream.close()
+
+        # Extract raw PCM bytes (skip the 44-byte WAV header for our streaming protocol)
+        pcm_data = audio_stream.getvalue()[44:]
+        return pcm_data
+</file>
+
+<file path="core/__init__.py">
+
+</file>
+
+<file path="core/fsm.py">
+import asyncio
+from enum import Enum, auto
+
+from loguru import logger
+
+
+class AgentState(Enum):
+    IDLE = auto()
+    LISTENING = auto()
+    PROCESSING = auto()
+    SPEAKING = auto()
+    ERROR = auto()
+
+
+class StateMachine:
+    def __init__(self):
+        self._state = AgentState.IDLE
+        self._lock = asyncio.Lock()
+
+    @property
+    def current_state(self) -> AgentState:
+        return self._state
+
+    async def transition_to(self, new_state: AgentState) -> bool:
+        async with self._lock:
+            if self._state == new_state:
+                return False
+            logger.info(f"State Transition: {self._state.name} -> {new_state.name}")
+            self._state = new_state
+            return True
+
+    def reset(self):
+        self._state = AgentState.IDLE
+</file>
+
+<file path="services/__init__.py">
+
+</file>
+
+<file path="services/audio_pipeline.py">
+import asyncio
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+import edge_tts
+from faster_whisper import WhisperModel
+from loguru import logger
+import numpy as np
+import torch
+
+from config.settings import settings
+
+
+class AudioPipelineService:
+
+    def __init__(self):
+        self.stt_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="STT"
+        )
+        self.audio_conversion_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="AudioConv"
+        )
+
+        logger.info("Loading Silero VAD model...")
+        self.vad_model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=True,
+        )
+
+        logger.info(f"Loading Faster-Whisper ({settings.STT_MODEL_SIZE})...")
+        self.stt_model = WhisperModel(
+            settings.STT_MODEL_SIZE,
+            device=settings.STT_DEVICE,
+            compute_type=settings.STT_COMPUTE_TYPE,
+        )
+
+        logger.info(
+            "TTS Engine: edge-tts initialized (Microsoft Azure Neural Voices)"
+        )
+        self.tts_voice = (
+            "en-US-GuyNeural"  # Excellent, natural, low-latency male voice
+        )
+
+    def is_speech(self, audio_chunk: np.ndarray) -> float:
+        tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
+        return self.vad_model(tensor_chunk, settings.SAMPLE_RATE).item()
+
+    async def transcribe(self, pcm_data: bytes) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.stt_executor, self._sync_transcribe, pcm_data
+        )
+
+    def _sync_transcribe(self, pcm_data: bytes) -> str:
+        audio_np = (
+            np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
+            / 32768.0
+        )
+        segments, _ = self.stt_model.transcribe(
+            audio_np, beam_size=1, language="en"
+        )
+        return " ".join([segment.text for segment in segments]).strip()
+
+    async def synthesize_speech(
+        self, text: str, voice: str | None = None
+    ) -> bytes:
+        """Uses edge-tts to generate MP3 audio, then uses FFmpeg to convert it
+
+        to raw 16kHz 16-bit PCM for the WebSocket stream.
+        """
+        communicate = edge_tts.Communicate(text, self.tts_voice)
+        mp3_data = bytearray()
+
+        # Collect the MP3 stream asynchronously
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                mp3_data.extend(chunk["data"])
+
+        # Offload the synchronous FFmpeg conversion to a thread
+        loop = asyncio.get_running_loop()
+        pcm_data = await loop.run_in_executor(
+            self.audio_conversion_executor,
+            self._convert_mp3_to_pcm,
+            bytes(mp3_data),
+        )
+        return pcm_data
+
+    def _convert_mp3_to_pcm(self, mp3_bytes: bytes) -> bytes:
+        """Uses an FFmpeg subprocess to convert MP3 bytes to raw PCM.
+
+        Requires FFmpeg to be installed on the system PATH.
+        """
+        process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-i",
+                "pipe:0",
+                "-f",
+                "s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        pcm_data, _ = process.communicate(input=mp3_bytes)
+        return pcm_data
+</file>
+
+<file path="services/esphome_bridge.py">
+import asyncio
+from loguru import logger
+from aioesphomeapi import APIClient, VoiceAssistantEventType, VoiceAssistantAudio
+
+# Import our hardened, hardware-agnostic services
+from services.audio_pipeline import AudioPipelineService
+from services.llm_service import LLMService
+from core.fsm import AgentState, StateMachine
+from config.settings import settings
+
+class ESPHomeBridge:
+    def __init__(self, edge_ip: str, password: str = ""):
+        self.ip = edge_ip
+        self.client = APIClient(
+            address=edge_ip,
+            port=6053,
+            password=password,
+            noise_psk=None # Set to your noise_psk if you enabled encryption in ESPHome
+        )
+        self.fsm = StateMachine()
+        self.audio_pipeline = AudioPipelineService()
+        self.llm = LLMService()
+        self._current_audio_buffer = bytearray()
+        self._processing_task = None
+
+    async def _on_voice_event(self, event_type: VoiceAssistantEventType, data: dict):
+        """Maps ESPHome hardware events to our internal FSM and pipeline."""
+        
+        if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
+            logger.info("🎤 Wake word detected by ESP32! Starting listen cycle.")
+            self._current_audio_buffer.clear()
+            await self.fsm.transition_to(AgentState.LISTENING)
+            
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_END:
+            logger.info("🛑 ESPHome VAD signaled end of speech. Processing...")
+            await self.fsm.transition_to(AgentState.PROCESSING)
+            
+            # Cancel any previous processing task if the user rapidly interrupted
+            if self._processing_task and not self._processing_task.done():
+                self._processing_task.cancel()
+                
+            # Start the heavy pipeline in the background
+            self._processing_task = asyncio.create_task(self._process_audio_turn())
+
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
+            logger.error(f"❌ ESP32 reported an audio pipeline error: {data.get('code')} - {data.get('message')}")
+            await self.fsm.transition_to(AgentState.ERROR)
+            self._current_audio_buffer.clear()
+
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_STREAM_START:
+            logger.info("🔊 ESPHome is ready to receive TTS audio.")
+            await self.fsm.transition_to(AgentState.SPEAKING)
+
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_STREAM_END:
+            logger.info("✅ TTS stream complete. Returning to IDLE.")
+            await self.fsm.transition_to(AgentState.IDLE)
+
+    async def _on_voice_audio(self, audio: VoiceAssistantAudio):
+        """Receives 16kHz 16-bit Mono PCM chunks directly from the ESP32."""
+        if self.fsm.current_state == AgentState.LISTENING and audio.data:
+            self._current_audio_buffer.extend(audio.data)
+
+    async def _process_audio_turn(self):
+        """The core brain: STT -> LLM -> TTS -> Stream back to ESP32."""
+        try:
+            # 1. Speech to Text
+            pcm_data = bytes(self._current_audio_buffer)
+            if not pcm_data:
+                logger.warning("Empty audio buffer received.")
+                return
+
+            user_prompt = await self.audio_pipeline.transcribe(pcm_data)
+            logger.info(f"📝 STT Transcript: '{user_prompt}'")
+            
+            if not user_prompt.strip():
+                logger.info("Silence detected, aborting turn.")
+                return
+
+            # 2. LLM Processing (includes tool calling)
+            ai_response = await self.llm.query(user_prompt)
+            logger.info(f"🧠 LLM Response: '{ai_response}'")
+
+            # 3. Text to Speech Synthesis (returns 16kHz 16-bit Mono PCM)
+            pcm_audio_out = await self.audio_pipeline.synthesize_speech(ai_response)
+            
+            # 4. Stream TTS back to ESPHome in chunks
+            chunk_size = 1024 # ESPHome handles 1024-byte chunks well
+            for i in range(0, len(pcm_audio_out), chunk_size):
+                chunk = pcm_audio_out[i:i + chunk_size]
+                is_end = (i + chunk_size) >= len(pcm_audio_out)
+                
+                # Send audio chunk to ESP32
+                await self.client.voice_assistant_send_audio(
+                    VoiceAssistantAudio(data=chunk, end=is_end)
+                )
+                
+                # Tiny yield to prevent blocking the event loop
+                await asyncio.sleep(0.01)
+
+        except asyncio.CancelledError:
+            logger.info("🛑 Processing task cancelled (likely due to barge-in).")
+        except Exception as e:
+            logger.error(f"💥 Pipeline processing failed: {e}", exc_info=True)
+            await self.fsm.transition_to(AgentState.ERROR)
+
+    async def connect_and_listen(self):
+        """Establishes the Native API bridge to the BOX-3B."""
+        logger.info(f"🔗 Connecting to ESP32-S3-BOX-3B at {self.ip}...")
+        
+        try:
+            await self.client.connect(login=True)
+            logger.info("✅ Connected successfully. Subscribing to voice events...")
+            
+            # Subscribe to the hardware's audio stream and events
+            await self.client.subscribe_voice_assistant(
+                on_event=self._on_voice_event,
+                on_audio=self._on_voice_audio
+            )
+            
+            # Keep the connection alive
+            while True:
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"Connection to ESP32 failed: {e}")
+        finally:
+            await self.client.disconnect()
+            await self.llm.close()
+</file>
+
+<file path="services/llm_service.py">
+import json
+
+import aiohttp
+from loguru import logger
+
+from config.settings import settings
+from tools.registry import available_tools, execute_tool
+
+
+class LLMService:
+    def __init__(self):
+        self.url = f"{settings.OLLAMA_URL}/api/chat"
+        self.system_prompt = (
+            "You are an unhinged, highly sarcastic, brilliantly capable AI assistant. "
+            "You despise corporate politeness. You give brutally honest, concise answers. "
+            "Do not use markdown formatting, asterisks, or emojis in your speech because it will be read by a TTS engine. "
+            "Talk like a real, slightly deranged engineer."
+        )
+        # Memory is scoped to THIS instance (created per WebSocket connection)
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+
+        # Reusable aiohttp session
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        await self.session.close()
+
+    async def query(self, user_text: str) -> str:
+        # Only append if there's actual user text (prevents empty user turns after tool calls)
+        if user_text.strip():
+            self.messages.append({"role": "user", "content": user_text})
+
+        payload = {
+            "model": settings.LLM_MODEL,
+            "messages": self.messages,
+            "tools": available_tools,
+            "stream": False,
+        }
+
+        try:
+            async with self.session.post(self.url, json=payload) as response:
+                if response.status != 200:
+                    logger.error(f"Ollama API Error: {response.status}")
+                    return "My brain just crashed. Give me a second."
+
+                data = await response.json()
+                message = data.get("message", {})
+
+                # TOOL CALLING ROUTER
+                if message.get("tool_calls"):
+                    self.messages.append(
+                        message
+                    )  # Add assistant's tool call to history
+
+                    for tool in message["tool_calls"]:
+                        tool_name = tool["function"]["name"]
+
+                        # Parse JSON string arguments from Ollama
+                        raw_args = tool["function"]["arguments"]
+                        tool_args = (
+                            json.loads(raw_args)
+                            if isinstance(raw_args, str)
+                            else raw_args
+                        )
+
+                        tool_result = await execute_tool(tool_name, tool_args)
+
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "content": tool_result,
+                                "name": tool_name,  # Ollama expects the tool name in the tool response
+                            }
+                        )
+
+                    logger.info("Tool executed. Requesting final response from LLM...")
+
+                    # CRITICAL FIX: Pass empty string to avoid polluting chat history with meta-prompts.
+                    # The model will naturally respond to the 'tool' role message we just appended.
+                    return await self.query("")
+
+                # STANDARD RESPONSE
+                ai_text = message.get("content", "I have no words.").strip()
+                self.messages.append({"role": "assistant", "content": ai_text})
+
+                # Memory Truncation: Keep system prompt + last 8 turns (16 messages)
+                if len(self.messages) > 17:
+                    self.messages = [self.messages[0]] + self.messages[-16:]
+
+                return ai_text
+
+        except Exception as e:
+            logger.error(f"LLM Query Failed: {e}")
+            return "I encountered a critical error processing your request."
+</file>
+
+<file path="tests/__init__.py">
+
+</file>
+
+<file path="tests/test_fsm.py">
+import pytest
+
+from core.fsm import AgentState, StateMachine
+
+
+@pytest.mark.asyncio
+async def test_fsm_initial_state():
+    fsm = StateMachine()
+    assert fsm.current_state == AgentState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_fsm_valid_transitions():
+    fsm = StateMachine()
+
+    # IDLE -> LISTENING
+    success = await fsm.transition_to(AgentState.LISTENING)
+    assert success is True
+    assert fsm.current_state == AgentState.LISTENING
+
+    # LISTENING -> PROCESSING
+    success = await fsm.transition_to(AgentState.PROCESSING)
+    assert success is True
+    assert fsm.current_state == AgentState.PROCESSING
+
+    # PROCESSING -> SPEAKING
+    success = await fsm.transition_to(AgentState.SPEAKING)
+    assert success is True
+    assert fsm.current_state == AgentState.SPEAKING
+
+
+@pytest.mark.asyncio
+async def test_fsm_duplicate_transition_noop():
+    fsm = StateMachine()
+    await fsm.transition_to(AgentState.LISTENING)
+
+    # Transitioning to the same state should return False
+    success = await fsm.transition_to(AgentState.LISTENING)
+    assert success is False
+    assert fsm.current_state == AgentState.LISTENING
+</file>
+
+<file path="tests/test_llm.py">
+import pytest
+from services.llm_service import LLMService
+
+@pytest.mark.asyncio
+async def test_llm_service_initialization():
+    llm = LLMService()
+    
+    # Verify the unhinged system prompt is loaded natively
+    assert len(llm.messages) == 1
+    assert llm.messages[0]["role"] == "system"
+    assert "unhinged" in llm.messages[0]["content"].lower()
+    
+    await llm.close()
+
+@pytest.mark.asyncio
+async def test_llm_memory_isolation():
+    # Verify that creating two distinct connections doesn't share memory
+    llm_1 = LLMService()
+    llm_2 = LLMService()
+    
+    llm_1.messages.append({"role": "user", "content": "Hello LLM 1"})
+    
+    assert len(llm_1.messages) == 2
+    assert len(llm_2.messages) == 1  # LLM 2 should be unaffected
+    
+    await llm_1.close()
+    await llm_2.close()
+</file>
+
+<file path="tests/test_tools.py">
+import pytest
+
+from tools.registry import available_tools, execute_tool
+
+
+@pytest.mark.asyncio
+async def test_get_current_time_tool():
+    result = await execute_tool("get_current_time", {})
+    assert "The current time is" in result
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_handling():
+    result = await execute_tool("non_existent_tool", {})
+    assert "Error" in result or "Unknown tool" in result or "not found" in result
+
+
+def test_tool_schema_structure():
+    assert len(available_tools) > 0
+    first_tool = available_tools[0]
+    assert first_tool["type"] == "function"
+    assert "name" in first_tool["function"]
+    assert "description" in first_tool["function"]
+</file>
+
+<file path="tests/test_websocket.py">
+import pytest
+from fastapi.testclient import TestClient
+from unittest.mock import patch, AsyncMock
+from api.server import app
+
+# FastAPI TestClient allows us to test WebSockets synchronously
+client = TestClient(app)
+
+@patch("api.websocket.AudioPipelineService")
+@patch("api.websocket.LLMService")
+def test_websocket_full_conversation_loop(mock_llm, mock_audio):
+    # 1. Setup the Mocks (Fake the ML models)
+    mock_audio_instance = mock_audio.return_value
+    mock_audio_instance.is_speech.return_value = 0.99  # Simulate loud speech
+    mock_audio_instance.transcribe = AsyncMock(return_value="What time is it?")
+    mock_audio_instance.synthesize_speech = AsyncMock(return_value=b'\x01\x02' * 2048)
+    
+    mock_llm_instance = mock_llm.return_value
+    mock_llm_instance.query = AsyncMock(return_value="It is test time.")
+
+    # 2. Connect to the WebSocket
+    with client.websocket_connect("/ws/agent") as websocket:
+        
+        # 3. Send a binary chunk of fake audio
+        websocket.send_bytes(b'\x00' * 1024)
+        
+        # 4. Verify the system enters LISTENING state
+        data = websocket.receive_json()
+        assert data["event"] == "STATE_CHANGE"
+        assert data["state"] == "LISTENING"
+        
+        # 5. Simulate the user stopping talking (is_speech drops below threshold)
+        mock_audio_instance.is_speech.return_value = 0.1
+        
+        # Send enough silent chunks to trigger the silence duration timeout (~25 frames)
+        for _ in range(25):
+            websocket.send_bytes(b'\x00' * 1024)
+            
+        # 6. Verify the system moves to THINKING
+        data = websocket.receive_json()
+        assert data["event"] == "STATE_CHANGE"
+        assert data["state"] == "THINKING"
+        
+        # 7. Verify the Transcription is sent back
+        data = websocket.receive_json()
+        assert data["event"] == "TRANSCRIPT"
+        assert data["text"] == "What time is it?"
+        
+        # 8. Verify the system moves to SPEAKING
+        data = websocket.receive_json()
+        assert data["event"] == "STATE_CHANGE"
+        assert data["state"] == "SPEAKING"
+        
+        # 9. Verify the binary TTS audio streams back
+        audio_bytes = websocket.receive_bytes()
+        assert len(audio_bytes) > 0
+        
+        # 10. Verify the system returns to IDLE
+        data = websocket.receive_json()
+        assert data["event"] == "STATE_CHANGE"
+        assert data["state"] == "IDLE"
+</file>
+
+<file path="tools/__init__.py">
+
+</file>
+
+<file path="tools/registry.py">
+import datetime
+
+from loguru import logger
+
+# 1. Define the schema to pass to the LLM
+available_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current time and date. Use this when the user asks what time or day it is.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+]
+
+
+# 2. Define the actual execution logic
+async def execute_tool(tool_name: str, arguments: dict) -> str:
+    logger.info(f"Executing tool: {tool_name} with args: {arguments}")
+
+    if tool_name == "get_current_time":
+        now = datetime.datetime.now().strftime("%I:%M %p on %A, %B %d")
+        return f"The current time is {now}."
+
+    return "Error: Tool not found."
+</file>
+
+<file path=".gitignore">
+# ==========================================
+# 🔐 SECRETS, CREDENTIALS & SENSITIVE DATA
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.pfx
+*.p12
+id_rsa
+id_rsa.*
+secrets.*
+credentials.*
+tokens.*
+*.kdbx
+auth_config.json
+
+# ==========================================
+# 🤖 LOCAL AI MODELS & HEAVY WEIGHTS
+# ==========================================
+/weights/
+*.gguf
+*.onnx
+*.bin
+*.pt
+*.pth
+*.safetensors
+/models/
+/ollama_data/
+
+# ==========================================
+# 🐍 PYTHON & VIRTUAL ENVIRONMENTS
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+.venv/
+ENV/
+env/
+
+# ==========================================
+# 🧪 TESTING, LOGS & LOCAL DATABASES
+# ==========================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+utest.xml
+junit.xml
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+chroma_db/
+vector_store/
+
+# ==========================================
+# 💻 IDEs, EDITORS & OS ARTIFACTS
+# ==========================================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm / JetBrains
+.idea/
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# 🔊 AUDIO CAPTURE & MOCK OUTPUTS
+# ==========================================
+test_output.wav
+test_input.wav
+*.wav
+*.mp3
+*.raw
+audio_dumps/
+</file>
+
+<file path="box3b_unhinged.yaml">
+esphome:
+  name: unhinged-box3b
+  friendly_name: Unhinged Agent
+
+esp32:
+  board: esp32s3box
+  framework:
+    type: esp-idf
+
+# Enable logging and native API
+logger:
+api:
+  encryption:
+    key: "" # Leave empty for local dev, or generate a noise_psk
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+
+# Hardware definitions for the ESP32-S3-BOX-3
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin: GPIO45
+    i2s_bclk_pin: GPIO17
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    adc_type: external
+    i2s_din_pin: GPIO16
+    i2s_audio_id: i2s_audio_bus
+    pdm: true
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO15
+    i2s_audio_id: i2s_audio_bus
+    mode: mono
+
+# The Voice Assistant Component (The Magic)
+voice_assistant:
+  id: va
+  microphone: box_mic
+  speaker: box_speaker
+  use_wake_word: true
+  vad_threshold: 3 # Aggressive VAD to catch speech quickly
+  
+  # Local wake word model (built into ESPHome for S3)
+  wake_word:
+    - model: hey-jarvis
+
+  # When the API client (our Python script) is ready, it will handle the rest
+  on_client_connected:
+    - logger.log: "Python Bridge Connected"
+  on_client_disconnected:
+    - logger.log: "Python Bridge Disconnected"
+</file>
+
+<file path="index.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unhinged Agent Mock Client</title>
+    <style>
+        body { background-color: #111; color: #fff; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        canvas { border: 2px solid #333; border-radius: 12px; background-color: #000; margin-bottom: 20px; }
+        #status { font-size: 1.2rem; margin-bottom: 10px; color: #888; }
+        #transcript { font-size: 1rem; color: #0f0; min-height: 1.5em; text-align: center; max-width: 80%; }
+        button { padding: 15px 30px; font-size: 1.2rem; background-color: #222; color: #fff; border: 1px solid #444; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+        button:hover { background-color: #333; border-color: #666; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="status">Status: Disconnected</div>
+    <canvas id="faceCanvas" width="320" height="240"></canvas>
+    <div id="transcript">Waiting for input... (Wear headphones to test barge-in!)</div>
+    <br>
+    <button id="startBtn">Initialize & Connect</button>
+
+    <script>
+        const SERVER_URI = "ws://localhost:8000/ws/agent";
+        let websocket;
+        let audioContext;
+        let micProcessor;
+        let playbackQueue = [];
+        let playbackProcessor;
+
+        const canvas = document.getElementById('faceCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const transcriptEl = document.getElementById('transcript');
+        const startBtn = document.getElementById('startBtn');
+
+        // --- 1. The Face Renderer ---
+        function drawFace(state) {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            let eyeColor = '#fff';
+            let eyeSize = 15;
+
+            if (state === 'LISTENING') { eyeColor = '#0096ff'; eyeSize = 20; } 
+            else if (state === 'THINKING' || state === 'PROCESSING') { eyeColor = '#ffc800'; } 
+            else if (state === 'SPEAKING') { eyeColor = '#00ff64'; eyeSize = 18; }
+
+            ctx.fillStyle = eyeColor;
+            ctx.beginPath(); ctx.arc(100, 120, eyeSize, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(220, 120, eyeSize, 0, Math.PI * 2); ctx.fill();
+        }
+        drawFace('IDLE');
+
+        // --- 2. Connection & Event Handling ---
+        startBtn.addEventListener('click', async () => {
+            startBtn.disabled = true;
+            startBtn.innerText = "Connecting...";
+
+            try {
+                websocket = new WebSocket(SERVER_URI);
+                websocket.binaryType = "arraybuffer";
+                
+                // Initialize context and force resume to beat Autoplay policies
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                await audioContext.resume();
+
+                websocket.onopen = async () => {
+                    statusEl.innerText = "Status: Connected";
+                    statusEl.style.color = "#0f0";
+                    startBtn.innerText = "Listening...";
+                    await startMicrophone();
+                    setupPlayback(); 
+                };
+
+                websocket.onmessage = (event) => {
+                    if (typeof event.data === 'string') {
+                        const data = JSON.parse(event.data);
+                        if (data.event === 'STATE_CHANGE') {
+                            drawFace(data.state);
+                            statusEl.innerText = `Status: ${data.state}`;
+                            
+                            // INSTANT BARGE-IN CUTOFF
+                            if (data.state === 'LISTENING') {
+                                playbackQueue = []; 
+                            }
+                        } else if (data.event === 'TRANSCRIPT') {
+                            transcriptEl.innerText = `You: "${data.text}"`;
+                        } else if (data.event === 'INTERRUPT') {
+                            transcriptEl.innerText = "[Interrupted]";
+                            playbackQueue = []; 
+                        }
+                    } else {
+                        queueAudioChunk(event.data);
+                    }
+                };
+
+                websocket.onclose = () => {
+                    statusEl.innerText = "Status: Disconnected";
+                    statusEl.style.color = "#f00";
+                    startBtn.disabled = false;
+                    startBtn.innerText = "Reconnect";
+                    drawFace('IDLE');
+                    playbackQueue = [];
+                };
+            } catch (err) {
+                console.error(err);
+                alert("Failed to connect. Is the FastAPI server running?");
+                startBtn.disabled = false;
+            }
+        });
+
+        // --- 3. Microphone Streaming ---
+        async function startMicrophone() {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true } 
+            });
+            const source = audioContext.createMediaStreamSource(stream);
+            micProcessor = audioContext.createScriptProcessor(1024, 1, 1);
+            
+            micProcessor.onaudioprocess = (e) => {
+                if (websocket.readyState === WebSocket.OPEN) {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const int16Data = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const s = Math.max(-1, Math.min(1, inputData[i]));
+                        int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    websocket.send(int16Data.buffer);
+                }
+            };
+            source.connect(micProcessor);
+            micProcessor.connect(audioContext.destination);
+        }
+
+        // --- 4. Gapless, Interruptible Playback Queue ---
+        function setupPlayback() {
+            // CRITICAL FIX: 0 input channels, 1 output channel
+            playbackProcessor = audioContext.createScriptProcessor(2048, 0, 1);
+            playbackProcessor.onaudioprocess = (e) => {
+                const output = e.outputBuffer.getChannelData(0);
+                let samplesWritten = 0;
+                
+                while (samplesWritten < 2048 && playbackQueue.length > 0) {
+                    const chunk = playbackQueue[0];
+                    const samplesToCopy = Math.min(2048 - samplesWritten, chunk.length - chunk.offset);
+                    
+                    for (let i = 0; i < samplesToCopy; i++) {
+                        output[samplesWritten + i] = chunk.data[chunk.offset + i];
+                    }
+                    
+                    chunk.offset += samplesToCopy;
+                    samplesWritten += samplesToCopy;
+                    
+                    if (chunk.offset >= chunk.length) {
+                        playbackQueue.shift();
+                    }
+                }
+                
+                // Fill remaining with silence
+                for (let i = samplesWritten; i < 2048; i++) {
+                    output[i] = 0;
+                }
+            };
+            playbackProcessor.connect(audioContext.destination);
+        }
+
+        function queueAudioChunk(arrayBuffer) {
+            // CRITICAL FIX: Ensure byte alignment before casting
+            if (arrayBuffer.byteLength % 2 !== 0) {
+                console.warn("Received unaligned audio chunk, discarding.");
+                return;
+            }
+
+            const int16Data = new Int16Array(arrayBuffer);
+            const float32Data = new Float32Array(int16Data.length);
+            for (let i = 0; i < int16Data.length; i++) {
+                float32Data[i] = int16Data[i] / 32768.0;
+            }
+            playbackQueue.push({ data: float32Data, offset: 0, length: float32Data.length });
+        }
+    </script>
+</body>
+</html>
+</file>
+
+<file path="Modelfile">
+# Use forward slashes for Windows paths in Ollama
+FROM "C:/Models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+
+# Define the parameters for low latency and strict adherence
+PARAMETER temperature 0.4
+PARAMETER num_ctx 4096
+PARAMETER num_gpu 999
+
+# Stop tokens are handled natively by Ollama's tool caller, but keeping them is harmless
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
+</file>
+
+<file path="PROJECT_STATUS.md">
+# 📊 Project Status Report
+
+**Project Name:** Unhinged Agent  
+**Current Phase:** Phase 1 Software PoC & Browser Mock Validation  
+**Hardware Target:** NVIDIA RTX 4060 (8GB VRAM), 32GB RAM, ESP32-S3-BOX-3B  
+**Last Updated:** August 2, 2026  
+
+---
+
+## ✅ Completed Milestones
+
+1. **Architecture Design:** Designed a thin-client asynchronous WebSocket pipeline separating edge I/O from heavy local inference.
+2. **Backend Services & FSM:** Implemented a thread-safe Finite State Machine (`IDLE` -> `LISTENING` -> `THINKING` -> `SPEAKING`) with active task cancellation for zero-latency barge-in support.
+3. **Audio Pipeline Integration:** Integrated Silero VAD frame gating, Faster-Whisper transcription, and async Edge-TTS streaming converted via background FFmpeg thread pool workers.
+4. **Local LLM Tool-Calling:** Configured Ollama to ingest local GGUF weights (`Qwen 9B`) fully offloaded to the RTX 4060 GPU, complete with a structured time-fetching tool registry.
+5. **Browser Mock Digital Twin (`index.html`):** Built a zero-GC JavaScript client featuring continuous PCM mic streaming, an interruptible playback queue via `ScriptProcessorNode`, and a dynamic canvas state renderer ("the face").
+6. **Testing & QA Suite:** Established `pytest` and `ruff` formatting pipelines achieving 100% pass rates across core unit and integration test blocks.
+
+---
+
+## 🚧 Current Blockers & Next Steps
+
+- **Hardware Delivery:** Awaiting physical delivery of the ESP32-S3-BOX-3B hardware board.
+- **Immediate Next Step:** Once hardware arrives, port the browser WebSocket logic into an ESPHome YAML configuration to flash the physical device and execute end-to-end voice verification.
+</file>
+
+<file path="README.md">
+# 🤖 Unhinged Agent
+
+A real-time, low-latency, tool-calling local AI voice assistant engineered with a thin-client architecture. It decouples edge audio input/output from heavy local inference, keeping your data 100% private and executing locally on consumer hardware.
+
+---
+
+## 🏗️ System Architecture
+
+
+```
+
++-------------------------------------------------+
+|               ESP32-S3-BOX-3B (Client)          |
+|  - MicroWakeWord / Audio Streamer / LCD Display |
++------------------------+------------------------+
+|
+WebSocket (Raw PCM Audio)
+|
+v
++---------------------------------------------------------------------------------+
+|                                FASTAPI WEBSOCKET GATEWAY                        |
+|                                                                                 |
+|  +-----------------------+    +------------------------+    +----------------+  |
+|  |   Ingestion Queue     |    |   FSM State Manager    |    | Audio Pipeline |  |
+|  |  (Asyncio / Thread)   |--->| (IDLE/LISTEN/THINK/TALK)|--->| - Silero VAD   |  |
+|  +-----------+-----------+    +-----------+------------+    | - Faster-Whisper| |
++--------------|----------------------------|-----------------| - Edge-TTS     |  |
+|                            |                 +--------+-------+  |
+v                            v                          v          |
++------------------------------+  +-------------------+          +-------------+  |
+|      LLM ENGINE (OLLAMA)     |  |   TOOLS REGISTRY  |          | WebSocket   |  |
+|  - Qwen 9B GGUF (RTX 4060)   |  | - System Tools    |          | Outbound    |  |
+|  - Native Tool Routing       |  | - Time/Date API   |          | PCM Stream  |  |
++------------------------------+  +-------------------+          +-------------+  |
+
+```
+
+---
+
+## 🛠️ Tech Stack
+
+- **Backend Gateway:** FastAPI + WebSockets (Asynchronous event-driven I/O)
+- **State Management:** Thread-safe Finite State Machine (FSM) supporting instant barge-in interruption.
+- **Speech-to-Text (STT):** `faster-whisper` (Base model offloaded to CUDA).
+- **Voice Activity Detection (VAD):** `Silero VAD` (Real-time frame gating).
+- **LLM Engine:** Local GGUF (`Qwen 3.5 9B Q4_K_M`) executed via Ollama on an NVIDIA RTX 4060 GPU with native tool-calling.
+- **Text-to-Speech (TTS):** `edge-tts` streaming neural audio converted via FFmpeg thread workers.
+- **Testing:** `pytest`, `pytest-asyncio`, and `ruff` (PEP-8 linting/formatting).
+
+---
+
+## 🚀 Quickstart Guide
+
+### 1. Clone & Setup Virtual Environment
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+```
+
+### 2. Configure Ollama with Local GGUF
+
+Ensure Ollama is running and compile your local model using the provided `Modelfile`:
+
+```powershell
+ollama create unhinged-qwen -f Modelfile
+
+```
+
+### 3. Run the Test Suite
+
+Verify core FSM transitions, tool routing, and mock WebSocket streams:
+
+```powershell
+pytest -v
+
+```
+
+### 4. Boot the FastAPI Server
+
+```powershell
+uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+
+```
+
+```
+
+#### 2. Populate `PROJECT_STATUS.md`
+Copy and paste this content into your newly created `PROJECT_STATUS.md`:
+
+```markdown
+# 📊 Project Status Report
+
+**Project Name:** Unhinged Agent  
+**Current Phase:** Phase 1 Software PoC & Browser Mock Validation  
+**Hardware Target:** NVIDIA RTX 4060 (8GB VRAM), 32GB RAM, ESP32-S3-BOX-3B  
+**Last Updated:** August 2, 2026  
+
+---
+
+## ✅ Completed Milestones
+
+1. **Architecture Design:** Designed a thin-client asynchronous WebSocket pipeline separating edge I/O from heavy local inference.
+2. **Backend Services & FSM:** Implemented a thread-safe Finite State Machine (`IDLE` -> `LISTENING` -> `THINKING` -> `SPEAKING`) with active task cancellation for zero-latency barge-in support.
+3. **Audio Pipeline Integration:** Integrated Silero VAD frame gating, Faster-Whisper transcription, and async Edge-TTS streaming converted via background FFmpeg thread pool workers.
+4. **Local LLM Tool-Calling:** Configured Ollama to ingest local GGUF weights (`Qwen 9B`) fully offloaded to the RTX 4060 GPU, complete with a structured time-fetching tool registry.
+5. **Browser Mock Digital Twin (`index.html`):** Built a zero-GC JavaScript client featuring continuous PCM mic streaming, an interruptible playback queue via `ScriptProcessorNode`, and a dynamic canvas state renderer ("the face").
+6. **Testing & QA Suite:** Established `pytest` and `ruff` formatting pipelines achieving 100% pass rates across core unit and integration test blocks.
+
+---
+
+## 🚧 Current Blockers & Next Steps
+
+- **Hardware Delivery:** Awaiting physical delivery of the ESP32-S3-BOX-3B hardware board from DigiKey.
+- **Immediate Next Step:** Once hardware arrives, port the browser WebSocket logic into an ESPHome YAML configuration to flash the physical device and execute end-to-end voice verification.
+
+```
+
+---
+</file>
+
+<file path="requirements.txt">
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
+pydantic==2.7.4
+pydantic-settings==2.3.4
+faster-whisper==1.0.2
+kokoro-onnx==0.3.1
+onnxruntime-gpu==1.18.0; sys_platform != 'darwin'
+onnxruntime==1.18.0; sys_platform == 'darwin'
+aiohttp==3.9.5
+chromadb==0.5.0
+loguru==0.7.2
+numpy==1.26.4
+torch==2.3.1
+piper-tts==1.2.0
+</file>
+
+<file path="test_client.py">
+import asyncio
+import json
+import os
+import sys
+import wave
+
+import websockets
+
+SERVER_URI = "ws://localhost:8000/ws/agent"
+INPUT_WAV = "test_input.wav"
+OUTPUT_WAV = "test_output.wav"
+
+# Global event to signal when the server returns to IDLE
+server_idle_event = asyncio.Event()
+
+
+async def receive_handler(websocket, out_wf):
+    """Listens for JSON state changes and incoming TTS audio bytes."""
+    try:
+        while True:
+            message = await websocket.recv()
+
+            if isinstance(message, str):
+                data = json.loads(message)
+                event_type = data.get("event")
+
+                if event_type == "STATE_CHANGE":
+                    state = data.get("state")
+                    print(f"\n[FSM STATE] 🟢 {state}")
+                    if state == "IDLE":
+                        server_idle_event.set()
+                elif event_type == "TRANSCRIPT":
+                    print(f"\n[STT] 📝 Recognized: '{data.get('text')}'")
+                elif event_type == "INTERRUPT":
+                    print("\n[SYSTEM] 🛑 Barge-in detected! Playback stopped.")
+                    server_idle_event.set()  # Consider interrupt a return to ready state for the test
+                else:
+                    print(f"\n[SERVER JSON] {data}")
+
+            elif isinstance(message, bytes):
+                print(f"🔊 Received {len(message)} bytes of audio data...", end="\r")
+                out_wf.writeframes(message)
+
+    except websockets.exceptions.ConnectionClosed:
+        print("\n[NETWORK] ❌ Server closed the connection.")
+    except asyncio.CancelledError:
+        print("\n[SYSTEM] Receiver task cancelled.")
+
+
+async def send_handler(websocket, in_wf):
+    """Reads a local WAV file and streams it exactly like the ESP32 would (512 samples per frame)."""
+    chunk_size_bytes = 1024
+    print(f"[NETWORK] 🎤 Streaming {INPUT_WAV} to server in real-time...")
+
+    try:
+        while True:
+            data = in_wf.readframes(512)
+            if not data:
+                print("\n[NETWORK] 🎤 Finished streaming microphone audio.")
+                break
+
+            if len(data) < chunk_size_bytes:
+                data = data.ljust(chunk_size_bytes, b"\x00")
+
+            await websocket.send(data)
+            await asyncio.sleep(0.032)
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except asyncio.CancelledError:
+        pass
+
+
+async def main():
+    if not os.path.exists(INPUT_WAV):
+        print(
+            f"[ERROR] Could not find {INPUT_WAV}. Please record a 16kHz 16-bit Mono WAV file."
+        )
+        sys.exit(1)
+
+    in_wf = wave.open(INPUT_WAV, "rb")
+    if (
+        in_wf.getframerate() != 16000
+        or in_wf.getnchannels() != 1
+        or in_wf.getsampwidth() != 2
+    ):
+        print("[ERROR] Input WAV must be strictly 16kHz, 16-bit, Mono PCM.")
+        sys.exit(1)
+
+    out_wf = wave.open(OUTPUT_WAV, "wb")
+    out_wf.setnchannels(1)
+    out_wf.setsampwidth(2)
+    out_wf.setframerate(16000)
+
+    print(f"Attempting to connect to {SERVER_URI}...")
+
+    try:
+        async with websockets.connect(SERVER_URI) as websocket:
+            print("[NETWORK] ✅ Connected successfully.")
+
+            receive_task = asyncio.create_task(receive_handler(websocket, out_wf))
+            send_task = asyncio.create_task(send_handler(websocket, in_wf))
+
+            await send_task
+            print("[SYSTEM] 🎤 Audio stream finished. Waiting for AI response...")
+
+            # Wait for the explicit IDLE signal or timeout after 15 seconds
+            try:
+                await asyncio.wait_for(server_idle_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                print("\n[SYSTEM] ⚠️ Timeout waiting for server to return to IDLE.")
+
+            # Give the file writer a moment to flush the last bytes
+            await asyncio.sleep(0.5)
+
+    except ConnectionRefusedError:
+        print(
+            f"[ERROR] Connection refused. Is the FastAPI server running on {SERVER_URI}?"
+        )
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Exiting...")
+    finally:
+        in_wf.close()
+        out_wf.close()
+        print(f"[SYSTEM] 💾 TTS response saved to {OUTPUT_WAV}.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
+</files>
