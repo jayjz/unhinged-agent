@@ -1,9 +1,8 @@
-# Modelfile
-FROM qwen2.5:7b
+﻿FROM qwen2.5:7b
 
-# Strict parameters for real-time voice latency
+# Strict parameters for real-time voice latency and VRAM safety
 PARAMETER temperature 0.4
-PARAMETER num_ctx 4096
+PARAMETER num_ctx 2048
 PARAMETER num_predict 100
 
 SYSTEM """

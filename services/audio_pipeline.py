@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from scipy.signal import resample
+from scipy.signal import resample_poly
 from faster_whisper import WhisperModel
 from kokoro_onnx import Kokoro
 from loguru import logger
@@ -65,9 +65,9 @@ class AudioPipelineService:
             # Kokoro returns float32 numpy array in [-1.0, 1.0] range at 24kHz
             samples, sample_rate = self.tts_model.create(text, voice=voice, speed=1.0)
             
-            # Scipy resampling to 16kHz for the ESP32 edge contract
-            target_samples = int(len(samples) * (16000 / sample_rate))
-            resampled = resample(samples, target_samples)
+            # Scipy polyphase resampling (24kHz to 16kHz -> 2:3 ratio)
+            # This avoids FFT ringing artifacts and is significantly faster
+            resampled = resample_poly(samples, 2, 3)
             
             # Clip to prevent integer overflow, then cast to 16-bit PCM
             pcm_samples = np.clip(resampled, -1.0, 1.0)

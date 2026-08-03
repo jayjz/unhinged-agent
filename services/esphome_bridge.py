@@ -77,14 +77,21 @@ class ESPHomeBridge:
 
             pcm_audio_out = await self.audio_pipeline.synthesize_speech(ai_response)
             
-            # Stream TTS back to ESPHome in 1024-byte chunks
+            # Stream TTS back to ESPHome in 1024-byte chunks (512 samples)
             chunk_size = 1024 
             for i in range(0, len(pcm_audio_out), chunk_size):
                 chunk = pcm_audio_out[i:i + chunk_size]
                 
-                # Directly send raw bytes (no class wrapper needed)
                 await self.client.send_voice_assistant_audio(chunk)
-                await asyncio.sleep(0.01)
+                
+                # Sleep for ~30ms to match real-time playback (512 samples / 16000Hz = 0.032s)
+                # This prevents flooding the ESP32 TCP buffer
+                await asyncio.sleep(0.03)
+
+            # CRITICAL FIX: Explicitly signal the end of the audio stream to ESPHome
+            # Sending an empty byte string triggers the ESP32 to close the media player buffer
+            # and re-engage the microphone AEC for the next wake word.
+            await self.client.send_voice_assistant_audio(b"")
 
         except asyncio.CancelledError:
             logger.info("🛑 Processing task cancelled (likely due to barge-in).")
@@ -112,5 +119,3 @@ class ESPHomeBridge:
             except Exception as e:
                 logger.warning(f"Connection to ESP32 failed or dropped: {e}. Retrying in 5 seconds...")
                 await asyncio.sleep(5)
-            # Note: We do NOT call self.llm.close() here, as we want to reconnect, not shut down.
-            # The LLM session will be properly closed by the FastAPI lifespan shutdown.
