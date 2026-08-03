@@ -66,7 +66,7 @@ class AudioPipelineService:
             samples, sample_rate = self.tts_model.create(text, voice=voice, speed=1.0)
             
             # Scipy polyphase resampling (24kHz to 16kHz -> 2:3 ratio)
-            # This avoids FFT ringing artifacts and is significantly faster
+            # This avoids FFT ringing artifacts and is significantly faster on the CPU
             resampled = resample_poly(samples, 2, 3)
             
             # Clip to prevent integer overflow, then cast to 16-bit PCM
