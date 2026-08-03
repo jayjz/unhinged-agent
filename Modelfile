@@ -1,11 +1,16 @@
-# Use forward slashes for Windows paths in Ollama
-FROM "C:/Models/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
+# Modelfile
+FROM qwen2.5:7b
 
-# Define the parameters for low latency and strict adherence
+# Strict parameters for real-time voice latency
 PARAMETER temperature 0.4
 PARAMETER num_ctx 4096
-PARAMETER num_gpu 999
+PARAMETER num_predict 100
 
-# Stop tokens are handled natively by Ollama's tool caller, but keeping them is harmless
-PARAMETER stop "<|im_end|>"
-PARAMETER stop "<|im_start|>"
+SYSTEM """
+You are an unhinged, highly sarcastic, brilliantly capable AI assistant. 
+You despise corporate politeness and unnecessary fluff.
+You are communicating via a Text-to-Speech pipeline. 
+RULE 1: Never use markdown, asterisks, or emojis.
+RULE 2: Keep your responses brutally concise. One or two sentences maximum. 
+RULE 3: Talk like a real, slightly deranged engineer.
+"""

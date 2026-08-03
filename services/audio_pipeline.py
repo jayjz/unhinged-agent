@@ -1,21 +1,19 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-import aiohttp
 import numpy as np
 import torch
+from scipy.signal import resample
 from faster_whisper import WhisperModel
+from kokoro_onnx import Kokoro
 from loguru import logger
 
 from config.settings import settings
 
-
 class AudioPipelineService:
     def __init__(self):
-        # We only need one executor now since TTS is handled via async HTTP
-        self.stt_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="STT"
-        )
+        self.stt_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="STT")
+        self.tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="TTS")
 
         logger.info("Loading Silero VAD model into CPU/RAM...")
         self.vad_model, _ = torch.hub.load(
@@ -32,60 +30,48 @@ class AudioPipelineService:
             compute_type=settings.stt_compute_type,
         )
 
-        logger.info(f"TTS Engine: Local Kokoro-82M via {settings.tts_endpoint}")
+        logger.info("Initializing Native Kokoro-82M TTS (CPU) to preserve GPU VRAM...")
+        try:
+            self.tts_model = Kokoro(
+                model_path="weights/kokoro-v0_19.onnx",
+                voices_path="weights/voices.bin"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load Kokoro TTS weights. Error: {e}")
+            self.tts_model = None
 
     def is_speech(self, audio_chunk: np.ndarray) -> float:
-        """Runs Silero VAD on a 16kHz audio frame."""
         tensor_chunk = torch.from_numpy(audio_chunk).float().unsqueeze(0)
         return self.vad_model(tensor_chunk, settings.audio_sample_rate).item()
 
     async def transcribe(self, pcm_data: bytes) -> str:
-        """Offloads synchronous Faster-Whisper transcription to a thread pool."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.stt_executor, self._sync_transcribe, pcm_data
-        )
+        return await loop.run_in_executor(self.stt_executor, self._sync_transcribe, pcm_data)
 
     def _sync_transcribe(self, pcm_data: bytes) -> str:
-        audio_np = (
-            np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
-            / 32768.0
-        )
-        segments, _ = self.stt_model.transcribe(
-            audio_np, beam_size=1, language="en"
-        )
+        audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self.stt_model.transcribe(audio_np, beam_size=1, language="en")
         return " ".join([segment.text for segment in segments]).strip()
 
     async def synthesize_speech(self, text: str, voice: str = "af_heart") -> bytes:
-        """
-        Calls the local Kokoro-FastAPI container asynchronously.
-        Expects a 16kHz 16-bit Mono WAV or PCM payload in return.
-        """
-        if not text.strip():
+        if not text.strip() or not self.tts_model:
             return b""
             
-        url = f"{settings.tts_endpoint}/v1/audio/speech"
-        payload = {
-            "input": text,
-            "voice": voice,
-            "response_format": "wav" 
-        }
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.tts_executor, self._sync_synthesize, text, voice)
 
+    def _sync_synthesize(self, text: str, voice: str) -> bytes:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=10.0) as response:
-                    if response.status != 200:
-                        logger.error(f"Local TTS Sidecar Error: HTTP {response.status}")
-                        return b""
-                    
-                    audio_bytes = await response.read()
-                    
-                    # Enforce the edge contract: Strip 44-byte WAV RIFF header to yield raw PCM
-                    if audio_bytes.startswith(b'RIFF'):
-                        return audio_bytes[44:]
-                        
-                    return audio_bytes
-                    
+            # Kokoro returns float32 numpy array in [-1.0, 1.0] range at 24kHz
+            samples, sample_rate = self.tts_model.create(text, voice=voice, speed=1.0)
+            
+            # Scipy resampling to 16kHz for the ESP32 edge contract
+            target_samples = int(len(samples) * (16000 / sample_rate))
+            resampled = resample(samples, target_samples)
+            
+            # Clip to prevent integer overflow, then cast to 16-bit PCM
+            pcm_samples = np.clip(resampled, -1.0, 1.0)
+            return (pcm_samples * 32767).astype(np.int16).tobytes()
         except Exception as e:
-            logger.error(f"Failed to connect to local TTS sidecar: {e}")
+            logger.error(f"Native TTS Synthesis failed: {e}")
             return b""
