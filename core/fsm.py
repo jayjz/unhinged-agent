@@ -12,8 +12,34 @@ class AgentState(Enum):
     ERROR = auto()
 
 
+class InvalidTransition(RuntimeError):
+    pass
+
+
+_ALLOWED_TRANSITIONS = {
+    AgentState.IDLE: {AgentState.LISTENING, AgentState.ERROR},
+    AgentState.LISTENING: {
+        AgentState.PROCESSING,
+        AgentState.IDLE,
+        AgentState.ERROR,
+    },
+    AgentState.PROCESSING: {
+        AgentState.SPEAKING,
+        AgentState.LISTENING,
+        AgentState.IDLE,
+        AgentState.ERROR,
+    },
+    AgentState.SPEAKING: {
+        AgentState.LISTENING,
+        AgentState.IDLE,
+        AgentState.ERROR,
+    },
+    AgentState.ERROR: {AgentState.IDLE},
+}
+
+
 class StateMachine:
-    def __init__(self):
+    def __init__(self) -> None:
         self._state = AgentState.IDLE
         self._lock = asyncio.Lock()
 
@@ -25,9 +51,14 @@ class StateMachine:
         async with self._lock:
             if self._state == new_state:
                 return False
-            logger.info(f"State Transition: {self._state.name} -> {new_state.name}")
+            if new_state not in _ALLOWED_TRANSITIONS[self._state]:
+                raise InvalidTransition(
+                    f"Invalid agent transition: {self._state.name} -> {new_state.name}"
+                )
+            logger.info("State transition: {} -> {}", self._state.name, new_state.name)
             self._state = new_state
             return True
 
-    def reset(self):
-        self._state = AgentState.IDLE
+    async def reset(self) -> None:
+        async with self._lock:
+            self._state = AgentState.IDLE
