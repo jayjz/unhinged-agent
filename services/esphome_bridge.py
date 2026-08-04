@@ -5,10 +5,25 @@ from aioesphomeapi import APIClient, VoiceAssistantEventType
 from services.audio_pipeline import AudioPipelineService
 from services.llm_service import LLMService
 from core.fsm import AgentState, StateMachine, InvalidTransition
+from config.settings import settings
 
 
 class ESPHomeBridge:
-    def __init__(self, edge_ip: str, password: str = ""):
+    """Edge bridge. Requires host-owned audio_pipeline + llm (no second GPU load)."""
+
+    def __init__(
+        self,
+        edge_ip: str,
+        audio_pipeline: AudioPipelineService,
+        llm: LLMService,
+        password: str = "",
+    ):
+        if audio_pipeline is None or llm is None:
+            raise ValueError(
+                "ESPHomeBridge requires shared audio_pipeline and llm from host lifespan. "
+                "Do not construct models inside the bridge — that double-loads VRAM."
+            )
+
         self.ip = edge_ip
         self.client = APIClient(
             address=edge_ip,
@@ -17,10 +32,12 @@ class ESPHomeBridge:
             noise_psk=None,
         )
         self.fsm = StateMachine()
-        self.audio_pipeline = AudioPipelineService()
-        self.llm = LLMService()
+        self.audio_pipeline = audio_pipeline
+        self.llm = llm
         self._current_audio_buffer = bytearray()
         self._processing_task = None
+        # Hard cap utterance size (16-bit mono @ sample rate) to protect host RAM
+        self._max_buffer_bytes = settings.max_utterance_seconds * settings.audio_sample_rate * 2
 
     async def _safe_transition(self, new_state: AgentState) -> bool:
         """Transition with guard; never let InvalidTransition crash the event loop."""
@@ -35,7 +52,6 @@ class ESPHomeBridge:
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
             logger.info("Wake word detected by ESP32. Starting listen cycle.")
-            # Barge-in: cancel any running turn immediately
             if self._processing_task and not self._processing_task.done():
                 self._processing_task.cancel()
             self._current_audio_buffer.clear()
@@ -66,12 +82,19 @@ class ESPHomeBridge:
     async def _on_voice_audio(self, data: bytes):
         """Receives 16kHz 16-bit Mono PCM chunks directly from the ESP32."""
         if self.fsm.current_state == AgentState.LISTENING and data:
+            remaining = self._max_buffer_bytes - len(self._current_audio_buffer)
+            if remaining <= 0:
+                return
+            if len(data) > remaining:
+                data = data[:remaining]
             self._current_audio_buffer.extend(data)
 
     async def _process_audio_turn(self):
-        """The core brain: STT -> LLM -> TTS -> Stream back to ESP32."""
+        """STT -> LLM -> TTS -> stream back to ESP32 (shared host models only)."""
         try:
             pcm_data = bytes(self._current_audio_buffer)
+            self._current_audio_buffer.clear()
+
             if not pcm_data:
                 logger.warning("Empty audio buffer received.")
                 await self._safe_transition(AgentState.IDLE)
@@ -90,16 +113,23 @@ class ESPHomeBridge:
 
             pcm_audio_out = await self.audio_pipeline.synthesize_speech(ai_response)
 
-            # Stream TTS back to ESPHome in 1024-byte chunks (512 samples @ 16-bit)
+            # Cap outbound TTS size to protect edge TCP buffer
+            max_out = settings.max_tts_response_bytes
+            if len(pcm_audio_out) > max_out:
+                logger.warning(
+                    "TTS output truncated from {} to {} bytes",
+                    len(pcm_audio_out),
+                    max_out,
+                )
+                pcm_audio_out = pcm_audio_out[:max_out]
+
             chunk_size = 1024
             for i in range(0, len(pcm_audio_out), chunk_size):
                 chunk = pcm_audio_out[i : i + chunk_size]
                 await self.client.send_voice_assistant_audio(chunk)
-                # ~32 ms pacing (512 samples / 16000 Hz) to avoid flooding ESP32 TCP buffer
+                # ~32 ms pacing (512 samples / 16000 Hz) — do not remove
                 await asyncio.sleep(0.03)
 
-            # Explicit end-of-stream signal so ESPHome closes the media player buffer
-            # and re-engages the microphone AEC for the next wake word.
             await self.client.send_voice_assistant_audio(b"")
 
         except asyncio.CancelledError:
@@ -110,7 +140,7 @@ class ESPHomeBridge:
             await self._safe_transition(AgentState.ERROR)
 
     async def connect_and_listen(self):
-        """Establishes the Native API bridge to the BOX-3B with auto-reconnect."""
+        """Native API bridge with auto-reconnect. Does not load models."""
         while True:
             logger.info("Attempting to connect to ESP32-S3-BOX-3B at {}...", self.ip)
             try:
@@ -122,7 +152,6 @@ class ESPHomeBridge:
                     self._on_voice_audio,
                 )
 
-                # Keep the connection alive
                 while True:
                     await asyncio.sleep(1)
 
