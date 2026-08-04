@@ -1,121 +1,85 @@
-# 🤖 Unhinged Agent
+# Unhinged Agent
 
-A real-time, low-latency, tool-calling local AI voice assistant engineered with a thin-client architecture. It decouples edge audio input/output from heavy local inference, keeping your data 100% private and executing locally on consumer hardware.
+Local, private, thin-client voice assistant. Edge audio runs on **ESP32-S3-BOX-3B** (ESPHome). Heavy inference stays on the host (RTX 4060 8GB).
+
+**Active branch for hardware prep:** `phase2/p0-hardware-prep`
 
 ---
 
-## 🏗️ System Architecture
-
+## Architecture
 
 ```
-
-+-------------------------------------------------+
-|               ESP32-S3-BOX-3B (Client)          |
-|  - MicroWakeWord / Audio Streamer / LCD Display |
-+------------------------+------------------------+
-|
-WebSocket (Raw PCM Audio)
-|
-v
-+---------------------------------------------------------------------------------+
-|                                FASTAPI WEBSOCKET GATEWAY                        |
-|                                                                                 |
-|  +-----------------------+    +------------------------+    +----------------+  |
-|  |   Ingestion Queue     |    |   FSM State Manager    |    | Audio Pipeline |  |
-|  |  (Asyncio / Thread)   |--->| (IDLE/LISTEN/THINK/TALK)|--->| - Silero VAD   |  |
-|  +-----------+-----------+    +-----------+------------+    | - Faster-Whisper| |
-+--------------|----------------------------|-----------------| - Edge-TTS     |  |
-|                            |                 +--------+-------+  |
-v                            v                          v          |
-+------------------------------+  +-------------------+          +-------------+  |
-|      LLM ENGINE (OLLAMA)     |  |   TOOLS REGISTRY  |          | WebSocket   |  |
-|  - Qwen 9B GGUF (RTX 4060)   |  | - System Tools    |          | Outbound    |  |
-|  - Native Tool Routing       |  | - Time/Date API   |          | PCM Stream  |  |
-+------------------------------+  +-------------------+          +-------------+  |
-
+ESP32-S3-BOX-3B (ESPHome)
+  wake word + mic + speaker + display labels
+        |
+        |  Native API (aioesphomeapi) — PCM in/out
+        v
+Host FastAPI
+  ESPHomeBridge (no model loads)
+  AudioPipeline  — Silero VAD (CPU) + faster-whisper base.en (CUDA) + Kokoro TTS (CPU)
+  LLMService     — Ollama tool-calling (GPU via Ollama)
+  SQLite notes tools
 ```
 
----
-
-## 🛠️ Tech Stack
-
-- **Backend Gateway:** FastAPI + WebSockets (Asynchronous event-driven I/O)
-- **State Management:** Thread-safe Finite State Machine (FSM) supporting instant barge-in interruption.
-- **Speech-to-Text (STT):** `faster-whisper` (Base model offloaded to CUDA).
-- **Voice Activity Detection (VAD):** `Silero VAD` (Real-time frame gating).
-- **LLM Engine:** Local GGUF (`Qwen 3.5 9B Q4_K_M`) executed via Ollama on an NVIDIA RTX 4060 GPU with native tool-calling.
-- **Text-to-Speech (TTS):** `edge-tts` streaming neural audio converted via FFmpeg thread workers.
-- **Testing:** `pytest`, `pytest-asyncio`, and `ruff` (PEP-8 linting/formatting).
+**VRAM rule:** Whisper + Kokoro + Ollama services are constructed **once** in `api/server.py` lifespan and injected into the bridge. Never instantiate `AudioPipelineService` / `LLMService` inside the bridge.
 
 ---
 
-## 🚀 Quickstart Guide
+## Stack
 
-### 1. Clone & Setup Virtual Environment
-```powershell
+| Piece | Implementation |
+|--------|----------------|
+| Edge | ESPHome `box3b_unhinged.yaml` |
+| Bridge | `aioesphomeapi` |
+| STT | `faster-whisper` `base.en` (default CUDA float16) |
+| TTS | `kokoro-onnx` on **CPU** |
+| LLM | Ollama local GGUF (`unhinged-qwen` / Modelfile) |
+| Memory | SQLite FTS5 notes |
+
+---
+
+## Quickstart (host)
+
+```bash
 python -m venv venv
-venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-```
-
-### 2. Configure Ollama with Local GGUF
-
-Ensure Ollama is running and compile your local model using the provided `Modelfile`:
-
-```powershell
 ollama create unhinged-qwen -f Modelfile
 
-```
+# Optional .env
+# ESPHOME_EDGE_IP=192.168.x.x
+# STT_DEVICE=cuda          # use cpu only for zero-GPU bring-up tests
+# STT_MODEL_SIZE=base.en   # do not raise on 8GB without measuring VRAM
 
-### 3. Run the Test Suite
-
-Verify core FSM transitions, tool routing, and mock WebSocket streams:
-
-```powershell
 pytest -v
-
+uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-### 4. Boot the FastAPI Server
+Kokoro weights expected at:
 
-```powershell
-uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+- `weights/kokoro-v0_19.onnx`
+- `weights/voices.bin`
 
-```
-
-```
-
-#### 2. Populate `PROJECT_STATUS.md`
-Copy and paste this content into your newly created `PROJECT_STATUS.md`:
-
-```markdown
-# 📊 Project Status Report
-
-**Project Name:** Unhinged Agent  
-**Current Phase:** Phase 1 Software PoC & Browser Mock Validation  
-**Hardware Target:** NVIDIA RTX 4060 (8GB VRAM), 32GB RAM, ESP32-S3-BOX-3B  
-**Last Updated:** August 2, 2026  
+If missing, STT/LLM still run; TTS returns empty audio.
 
 ---
 
-## ✅ Completed Milestones
+## Edge (when BOX-3B arrives)
 
-1. **Architecture Design:** Designed a thin-client asynchronous WebSocket pipeline separating edge I/O from heavy local inference.
-2. **Backend Services & FSM:** Implemented a thread-safe Finite State Machine (`IDLE` -> `LISTENING` -> `THINKING` -> `SPEAKING`) with active task cancellation for zero-latency barge-in support.
-3. **Audio Pipeline Integration:** Integrated Silero VAD frame gating, Faster-Whisper transcription, and async Edge-TTS streaming converted via background FFmpeg thread pool workers.
-4. **Local LLM Tool-Calling:** Configured Ollama to ingest local GGUF weights (`Qwen 9B`) fully offloaded to the RTX 4060 GPU, complete with a structured time-fetching tool registry.
-5. **Browser Mock Digital Twin (`index.html`):** Built a zero-GC JavaScript client featuring continuous PCM mic streaming, an interruptible playback queue via `ScriptProcessorNode`, and a dynamic canvas state renderer ("the face").
-6. **Testing & QA Suite:** Established `pytest` and `ruff` formatting pipelines achieving 100% pass rates across core unit and integration test blocks.
+1. Edit WiFi in `box3b_unhinged.yaml`.
+2. `esphome run box3b_unhinged.yaml`
+3. Reserve a static IP; set `ESPHOME_EDGE_IP` in host `.env`.
+4. Restart host; confirm `/health` and bridge “Connected” logs.
+5. One short wake-word turn; watch `nvidia-smi`.
 
----
-
-## 🚧 Current Blockers & Next Steps
-
-- **Hardware Delivery:** Awaiting physical delivery of the ESP32-S3-BOX-3B hardware board from DigiKey.
-- **Immediate Next Step:** Once hardware arrives, port the browser WebSocket logic into an ESPHome YAML configuration to flash the physical device and execute end-to-end voice verification.
-
-```
+See `PROJECT_STATUS.md` for the 10-day checklist.
 
 ---
+
+## Safety (GPU + edge)
+
+- Do **not** load a second Whisper/LLM in-process.
+- Keep STT at `base.en`; keep TTS on CPU.
+- Do not remove TTS stream pacing (~30 ms / 1024 bytes) — protects the ESP buffer.
+- Prefer a single Ollama model loaded at a time.
