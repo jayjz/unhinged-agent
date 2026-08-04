@@ -115,3 +115,10 @@ test_input.wav
 *.mp3
 *.raw
 audio_dumps/
+
+# ==========================================
+# 📦 REPO PACK / AI CONTEXT DUMPS
+# ==========================================
+repomix-output.xml
+repomix-output.*
+*.repomix.*
