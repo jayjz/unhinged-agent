@@ -17,38 +17,44 @@
 4. Local Ollama tool-calling LLM + SQLite FTS5 notes tools.
 5. Native Kokoro-ONNX TTS on CPU (VRAM reserved for Whisper + LLM).
 6. Mocked stress tests for barge-in (`tests/test_esphome_bridge_stress.py`).
+7. **VRAM safety:** single shared `AudioPipelineService` + `LLMService` injected into bridge (no double GPU load).
 
 ---
 
 ## P0 Checklist (No Scope Creep)
 
-### Pre-arrival (Days 1–3) — DONE / in this branch
+### Pre-arrival — DONE on this branch
 
-- [x] **P0-1 FSM hardening** — Allowed-transition table + `InvalidTransition`. Safe under race conditions.
-- [x] **P0-2 Config** — `esphome_edge_ip` / `esphome_password` in Settings; server uses them.
-- [x] **P0-3 Bridge** — Explicit cancel on new wake word, safe transitions, empty-buffer → IDLE.
-- [x] **P0-4 Notes DB** — `database/` created on first boot.
-- [x] **P0-5 Docs** — This status + CHANGELOG updated.
+- [x] FSM hardening (allow-list + `InvalidTransition`)
+- [x] Config: `esphome_edge_ip` / `esphome_password`
+- [x] Bridge barge-in cancel + safe transitions
+- [x] Notes DB creates `database/` on boot
+- [x] Docs / CHANGELOG / README Phase 2
+- [x] **Inject shared models into bridge (no second Whisper/LLM)**
+- [x] Utterance + TTS size caps on bridge
+- [x] `repomix-output.xml` removed + gitignored on this branch
 
 ### On arrival (Days 4–7)
 
-- [ ] Flash `box3b_unhinged.yaml` (set WiFi + optional API key).
-- [ ] Assign static IP to BOX-3B; set `ESPHOME_EDGE_IP` in `.env`.
-- [ ] Confirm host connects (`/health` shows edge_ip) and wake-word events reach the bridge.
-- [ ] First end-to-end: wake → STT → LLM → TTS playback on speaker.
+- [ ] Flash `box3b_unhinged.yaml` (WiFi)
+- [ ] Static IP → `ESPHOME_EDGE_IP` in `.env`
+- [ ] Host connect + wake events in logs
+- [ ] First e2e: wake → STT → LLM → TTS on speaker
+- [ ] Watch `nvidia-smi` on first turns
 
 ### Stabilization (Days 8–10)
 
-- [ ] Measure and tune barge-in latency on real hardware.
-- [ ] Confirm AEC / noise suppression levels in YAML.
-- [ ] Verify notes tools (`save_note` / `search_notes`) via voice.
-- [ ] Document flash + run procedure in README (minimal).
+- [ ] Barge-in latency on real hardware
+- [ ] AEC / noise levels in YAML
+- [ ] Voice notes tools
+- [ ] Minimal run docs if anything still missing
 
-**Out of scope until after day-10 demo:** LVGL face images, new tools, model swaps, browser mock revival, cloud anything.
+**Out of scope until after day-10 demo:** LVGL face images, new tools, model size upgrades, browser mock revival.
 
 ---
 
 ## Immediate Next Action
 
-1. Keep host running with correct `.env` (`ESPHOME_EDGE_IP`).
-2. When BOX-3B arrives: flash YAML → static IP → verify connection logs → speak.
+1. Local: `git fetch && git checkout phase2/p0-hardware-prep && pytest -v`
+2. Confirm Kokoro weights under `weights/` and Ollama model exists.
+3. On hardware day: flash → static IP → one short turn → measure VRAM.
