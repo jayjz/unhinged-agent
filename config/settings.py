@@ -18,10 +18,20 @@ class Settings(BaseSettings):
     ollama_url: str = Field(default="http://127.0.0.1:11434")
     ollama_model: str = Field(default="unhinged-qwen")
 
+    # --- ESPHome Edge (BOX-3B) ---
+    esphome_edge_ip: str = Field(
+        default="192.168.1.100",
+        description="Static IP of the ESP32-S3-BOX-3B on the local network",
+    )
+    esphome_password: str = Field(
+        default="",
+        description="Optional API password / encryption key for aioesphomeapi",
+    )
+
     # --- Audio Pipeline ---
     audio_sample_rate: int = Field(default=16000)
-    audio_frame_size: int = Field(default=512) 
-    
+    audio_frame_size: int = Field(default=512)
+
     # --- Model Configs ---
     stt_model_size: str = Field(default="base.en")
     stt_device: str = Field(default="cuda")
