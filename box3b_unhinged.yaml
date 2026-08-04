@@ -1,3 +1,16 @@
+# ============================================================
+# Unhinged Agent — ESP32-S3-BOX-3B ESPHome config
+# Branch: phase2/p0-hardware-prep
+#
+# FLASH STEPS (Day 1 after hardware arrives)
+# 1. Install ESPHome:  pip install esphome
+# 2. Edit wifi ssid/password below (or use secrets.yaml)
+# 3. Optional: set api encryption key (must match host if used)
+# 4. esphome run box3b_unhinged.yaml
+# 5. Give the device a static DHCP reservation (recommended)
+# 6. Set ESPHOME_EDGE_IP=<that-ip> in the host .env and restart
+# ============================================================
+
 esphome:
   name: unhinged-box3b
   friendly_name: Unhinged Agent
@@ -17,7 +30,7 @@ esp32:
 logger:
 api:
   encryption:
-    key: "" 
+    key: ""   # leave empty for first bring-up; set later if desired
 
 ota:
   - platform: esphome
@@ -25,9 +38,11 @@ ota:
 wifi:
   ssid: "YOUR_WIFI_SSID"
   password: "YOUR_WIFI_PASSWORD"
+  # After first boot, reserve a static IP for this MAC in your router
+  # then put that IP into the host .env as ESPHOME_EDGE_IP
 
 # ==========================================
-# 🔊 AUDIO HARDWARE & DSP ROUTING
+# AUDIO HARDWARE & DSP ROUTING
 # ==========================================
 i2s_audio:
   - id: i2s_audio_bus
@@ -56,28 +71,28 @@ media_player:
     speaker: box_speaker_dac
 
 # ==========================================
-# 📺 DISPLAY HARDWARE & SPI BUS
+# DISPLAY HARDWARE & SPI BUS
 # ==========================================
 spi:
   clk_pin: GPIO7
   mosi_pin: GPIO6
-  miso_pin: GPIO0 
+  miso_pin: GPIO0
 
 display:
   - platform: ili9341
-    model: M5Stack 
+    model: M5Stack
     id: box_display
     cs_pin: GPIO5
     dc_pin: GPIO4
     reset_pin: GPIO48
 
 # ==========================================
-# 🎨 LVGL UI SCAFFOLDING
+# LVGL UI SCAFFOLDING (text states for now)
 # ==========================================
 lvgl:
   displays:
     - display: box_display
-  
+
   widgets:
     - label:
         id: fsm_state_label
@@ -86,16 +101,16 @@ lvgl:
         text_align: CENTER
 
 # ==========================================
-# 🧠 ESP-SR VOICE ASSISTANT & FSM MAPPING
+# ESP-SR VOICE ASSISTANT & FSM MAPPING
 # ==========================================
 voice_assistant:
   id: va
   microphone: box_mic
-  media_player: box_media_player 
+  media_player: box_media_player
   use_wake_word: true
-  vad_threshold: 3 
-  noise_suppression_level: 2 
-  
+  vad_threshold: 3
+  noise_suppression_level: 2
+
   wake_word:
     - model: hey-jarvis
 
@@ -104,7 +119,7 @@ voice_assistant:
     - lvgl.label.update:
         id: fsm_state_label
         text: "CONNECTED\nREADY"
-  
+
   on_client_disconnected:
     - logger.log: "Python Bridge Disconnected"
     - lvgl.label.update:
@@ -116,19 +131,19 @@ voice_assistant:
     - lvgl.label.update:
         id: fsm_state_label
         text: "LISTENING..."
-        
+
   on_stt_end:
     - logger.log: "[EDGE] State: THINKING (VAD detected silence)"
     - lvgl.label.update:
         id: fsm_state_label
         text: "THINKING..."
-        
+
   on_tts_start:
     - logger.log: "[EDGE] State: SPEAKING"
     - lvgl.label.update:
         id: fsm_state_label
         text: "SPEAKING"
-        
+
   on_tts_end:
     - logger.log: "[EDGE] State: IDLE"
     - lvgl.label.update:
