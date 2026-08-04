@@ -1,21 +1,29 @@
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from core.fsm import AgentState
 from services.esphome_bridge import ESPHomeBridge
 
+
 @pytest.mark.asyncio
-@patch('services.esphome_bridge.AudioPipelineService')
-@patch('services.esphome_bridge.LLMService')
-async def test_esphome_bridge_initialization(mock_llm_class, mock_audio_class):
-    # Setup mocked services to prevent loading models into VRAM during CI
-    # CRITICAL FIX: Explicitly mock the async teardown method
-    mock_llm_class.return_value.close = AsyncMock()
-    
-    bridge = ESPHomeBridge(edge_ip="192.168.1.100")
-    
-    # Verify proper initial FSM state
+async def test_esphome_bridge_initialization():
+    """Bridge must accept injected services and never load VRAM models itself."""
+    mock_audio = MagicMock()
+    mock_llm = MagicMock()
+    mock_llm.close = AsyncMock()
+
+    bridge = ESPHomeBridge(
+        edge_ip="192.168.1.100",
+        audio_pipeline=mock_audio,
+        llm=mock_llm,
+    )
+
     assert bridge.fsm.current_state == AgentState.IDLE
-    
-    # Close resources
-    await bridge.llm.close()
+    assert bridge.audio_pipeline is mock_audio
+    assert bridge.llm is mock_llm
+
+
+@pytest.mark.asyncio
+async def test_esphome_bridge_rejects_missing_services():
+    with pytest.raises(ValueError, match="shared audio_pipeline"):
+        ESPHomeBridge(edge_ip="192.168.1.100", audio_pipeline=None, llm=MagicMock())
